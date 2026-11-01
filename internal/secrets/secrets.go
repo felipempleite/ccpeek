@@ -77,17 +77,27 @@ func New(store *db.Store) (*Scanner, error) {
 func RulesFingerprint() string { return rulesFingerprint() }
 
 var rulesFingerprint = sync.OnceValue(func() string {
+	var deps []*debug.Module
+	if info, ok := debug.ReadBuildInfo(); ok {
+		deps = info.Deps
+	}
+	return fingerprintFor(deps)
+})
+
+// fingerprintFor leaves out the module sum on purpose. Vendored builds
+// (Nix buildGoModule) record no sum, but module-mode builds do. With the
+// sum in the hash, the same gitleaks version got two fingerprints, and
+// each switch between those binaries re-scanned the whole archive.
+func fingerprintFor(deps []*debug.Module) string {
 	h := sha256.New()
 	fmt.Fprint(h, "scan-v3-canonical-text-tools-and-full-results\n", config.DefaultConfig)
-	if info, ok := debug.ReadBuildInfo(); ok {
-		for _, dep := range info.Deps {
-			if dep.Path == "github.com/zricethezav/gitleaks/v8" {
-				fmt.Fprint(h, dep.Version, dep.Sum)
-			}
+	for _, dep := range deps {
+		if dep.Path == "github.com/zricethezav/gitleaks/v8" {
+			fmt.Fprint(h, dep.Version)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
-})
+}
 
 // Run scans entities whose content changed since their last scan,
 // replaces their findings, and returns the complete stored findings set

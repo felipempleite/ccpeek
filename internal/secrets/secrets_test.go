@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -603,5 +604,21 @@ func TestScanArtifactsCrossesFetchPages(t *testing.T) {
 		if !got[key] {
 			t.Errorf("no finding for %s", key)
 		}
+	}
+}
+
+// A vendored build (Nix) records no module sum; a module-mode build does.
+// Both run the same rules, so they must agree, or switching binaries
+// re-scans the whole archive. A version change must still move it.
+func TestFingerprintIgnoresModuleSum(t *testing.T) {
+	gitleaks := func(version, sum string) []*debug.Module {
+		return []*debug.Module{{Path: "github.com/zricethezav/gitleaks/v8", Version: version, Sum: sum}}
+	}
+	vendored := fingerprintFor(gitleaks("v8.30.1", ""))
+	if module := fingerprintFor(gitleaks("v8.30.1", "h1:abc=")); module != vendored {
+		t.Errorf("same version, different sum: %s != %s", module, vendored)
+	}
+	if bumped := fingerprintFor(gitleaks("v8.31.0", "")); bumped == vendored {
+		t.Error("a gitleaks version bump did not change the fingerprint")
 	}
 }
