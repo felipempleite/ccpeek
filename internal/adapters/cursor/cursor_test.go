@@ -252,16 +252,26 @@ func TestParseRealRawJSONBlobStore(t *testing.T) {
 		id   string
 		body string
 	}{
-		{"ff00000000000000000000000000000000000000000000000000000000000001",
-			`{"role":"system","content":"You are an AI coding assistant, powered by Opus 4.6."}`},
-		{"aa00000000000000000000000000000000000000000000000000000000000002",
-			`{"role":"user","content":"Workspace Path: /home/u/demo/api\n\n<user_query>\nSpeed up CI\n</user_query>"}`},
-		{"bb00000000000000000000000000000000000000000000000000000000000003",
-			`{"role":"assistant","content":[{"type":"text","text":"On it."},{"type":"tool-call","toolCallId":"call_1","toolName":"Read","args":{"path":"Makefile"}}],"providerOptions":{"cursor":{}}}`},
-		{"cc00000000000000000000000000000000000000000000000000000000000004",
-			`{"role":"tool","content":[{"type":"tool-result","toolCallId":"call_1","toolName":"Read","result":"build:\n\tgo build"}]}`},
-		{"deadbeef00000000000000000000000000000000000000000000000000000000",
-			"this is not json"}, // binary/garbage skipped
+		{
+			"ff00000000000000000000000000000000000000000000000000000000000001",
+			`{"role":"system","content":"You are an AI coding assistant, powered by Opus 4.6."}`,
+		},
+		{
+			"aa00000000000000000000000000000000000000000000000000000000000002",
+			`{"role":"user","content":"Workspace Path: /home/u/demo/api\n\n<user_query>\nSpeed up CI\n</user_query>"}`,
+		},
+		{
+			"bb00000000000000000000000000000000000000000000000000000000000003",
+			`{"role":"assistant","content":[{"type":"text","text":"On it."},{"type":"tool-call","toolCallId":"call_1","toolName":"Read","args":{"path":"Makefile"}},{"type":"tool-call","toolCallId":"call_2","toolName":"Shell","args":{"command":"go test ./..."}},{"type":"tool-call","toolCallId":"call_3","toolName":"Edit","args":{"file_path":"app.go","old_string":"old","new_string":"new"}}],"providerOptions":{"cursor":{}}}`,
+		},
+		{
+			"cc00000000000000000000000000000000000000000000000000000000000004",
+			`{"role":"tool","content":[{"type":"tool-result","toolCallId":"call_1","toolName":"Read","result":"build:\n\tgo build"}]}`,
+		},
+		{
+			"deadbeef00000000000000000000000000000000000000000000000000000000",
+			"this is not json",
+		}, // binary/garbage skipped
 	}
 	for _, b := range blobs {
 		if _, err := sdb.Exec(`INSERT INTO blobs(id, data) VALUES (?, ?)`, b.id, []byte(b.body)); err != nil {
@@ -292,8 +302,12 @@ func TestParseRealRawJSONBlobStore(t *testing.T) {
 	if sink.Messages[0].Model != "Opus 4.6" {
 		t.Errorf("system model = %q, want full powered-by capture", sink.Messages[0].Model)
 	}
-	if len(sink.ToolCalls) != 1 || sink.ToolCalls[0].Name != "Read" {
+	if len(sink.ToolCalls) != 3 || sink.ToolCalls[0].Name != "Read" {
 		t.Fatalf("tool calls = %+v", sink.ToolCalls)
+	}
+	if sink.ToolCalls[0].FilePath != "Makefile" || sink.ToolCalls[1].Command != "go test ./..." ||
+		sink.ToolCalls[2].FilePath != "app.go" || sink.ToolCalls[2].OldText != "old" || sink.ToolCalls[2].NewText != "new" {
+		t.Errorf("tool fields = %+v", sink.ToolCalls)
 	}
 	if len(sink.ToolResults) != 1 || sink.ToolResults[0].CallExternalID != "call_1" {
 		t.Fatalf("tool results = %+v", sink.ToolResults)

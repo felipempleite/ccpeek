@@ -17,6 +17,7 @@ package cursor
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/hex"
@@ -334,6 +335,7 @@ func (a *Adapter) parseStore(ctx context.Context, src agent.SourceRef, sink agen
 					Input:             block.Args,
 					StartedAt:         ts,
 				}
+				populateToolFields(&tc, block.Args)
 				toolSeq++
 				if err := sink.ToolCall(tc); err != nil {
 					return err
@@ -356,6 +358,31 @@ func (a *Adapter) parseStore(ctx context.Context, src agent.SourceRef, sink agen
 		}
 	}
 	return nil
+}
+
+// populateToolFields keeps the original input while exposing the fields used
+// by the commands, file, and diff views for both Cursor transcript formats.
+func populateToolFields(call *canon.ToolCall, input json.RawMessage) {
+	var args struct {
+		Path        string `json:"path"`
+		FilePath    string `json:"file_path"`
+		FilePathAlt string `json:"filePath"`
+		TargetFile  string `json:"target_file"`
+		Command     string `json:"command"`
+		Cmd         string `json:"cmd"`
+		OldString   string `json:"old_string"`
+		OldText     string `json:"old_text"`
+		NewString   string `json:"new_string"`
+		NewText     string `json:"new_text"`
+		Content     string `json:"content"`
+	}
+	if json.Unmarshal(input, &args) != nil {
+		return
+	}
+	call.FilePath = cmp.Or(args.FilePath, args.FilePathAlt, args.Path, args.TargetFile)
+	call.Command = cmp.Or(args.Command, args.Cmd)
+	call.OldText = cmp.Or(args.OldString, args.OldText)
+	call.NewText = cmp.Or(args.NewString, args.NewText, args.Content)
 }
 
 // decodeBlobBytes accepts live Cursor raw-JSON BLOBs and the hex-encoded

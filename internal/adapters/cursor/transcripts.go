@@ -121,7 +121,6 @@ type transcriptPending struct {
 // parseTranscript reads one agent-transcripts JSONL file.
 func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink agent.RecordSink) error {
 	sessionID := transcriptSessionID(src.Path)
-	cwd := decodeProjectDir(projectDirFromTranscript(src.Path))
 
 	f, err := os.Open(src.Path)
 	if err != nil {
@@ -139,7 +138,6 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 		Agent:      Slug,
 		ExternalID: sessionID,
 		SourcePath: src.Path,
-		CWD:        cwd,
 		ModifiedAt: fileMod,
 	}
 
@@ -171,6 +169,9 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 			content = entry.Message.Content
 		}
 		text := transcriptText(content)
+		if sess.CWD == "" {
+			sess.CWD = workspaceFromText(text)
+		}
 		ts := time.Time{}
 		if t, ok := parseEmbeddedTimestamp(text); ok {
 			ts = t
@@ -187,7 +188,6 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 			Role:              canon.Role(role),
 			Kind:              canon.KindMessage,
 			CreatedAt:         ts,
-			CWD:               cwd,
 			Content:           json.RawMessage(append([]byte(nil), line...)),
 			Text:              text,
 		}
@@ -201,7 +201,7 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 				if ext == "" {
 					ext = fmt.Sprintf("L%d-%d", lineNo, i)
 				}
-				calls = append(calls, canon.ToolCall{
+				call := canon.ToolCall{
 					SessionExternalID: sessionID,
 					MessageSeq:        seq,
 					Seq:               toolSeq,
@@ -210,7 +210,9 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 					Kind:              normalizeTool(block.Name),
 					Input:             block.Input,
 					StartedAt:         ts,
-				})
+				}
+				populateToolFields(&call, block.Input)
+				calls = append(calls, call)
 				toolSeq++
 			}
 		}
@@ -230,6 +232,11 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 	if len(rows) == 0 {
 		return nil
 	}
+	// Encoded project directories are ambiguous when a path contains hyphens;
+	// prefer the workspace path recorded in the transcript whenever available.
+	if sess.CWD == "" {
+		sess.CWD = decodeProjectDir(projectDirFromTranscript(src.Path))
+	}
 
 	if sess.CreatedAt.IsZero() {
 		sess.CreatedAt = fileMod
@@ -245,6 +252,7 @@ func (a *Adapter) parseTranscript(ctx context.Context, src agent.SourceRef, sink
 		return err
 	}
 	for _, row := range rows {
+		row.msg.CWD = sess.CWD
 		if err := sink.Message(row.msg); err != nil {
 			return err
 		}

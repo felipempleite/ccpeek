@@ -185,12 +185,12 @@ ccpeek export commands --project myapp --from 2025-01-01 --to 2025-06-01
 
 ### Agent capability matrix
 
-| Agent       | Status            | Messages | Usage/cost | Tool calls | Notes                                                                                                                                 |
-| ----------- | ----------------- | -------- | ---------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code | supported         | ✓        | ✓          | ✓          | Sessions, all sidecar artifacts, prompt history, incremental tail parsing                                                             |
-| Pi          | supported         | ✓        | ✓          | ✓          | Documented session format; forks/branches; reported costs                                                                             |
-| Codex CLI   | supported         | ✓        | ✓          | ✓          | Rollout JSONL; cumulative token counts; current `exec_command`/`shell_command` and older command arrays                               |
-| OpenCode    | supported formats | ✓        | ✓          | ✓          | Native SQLite with WAL, and legacy JSON with separate part directories; tested with generated format fixtures                         |
+| Agent       | Status            | Messages | Usage/cost | Tool calls | Notes                                                                                                                               |
+| ----------- | ----------------- | -------- | ---------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Claude Code | supported         | ✓        | ✓          | ✓          | Sessions, all sidecar artifacts, prompt history, incremental tail parsing                                                           |
+| Pi          | supported         | ✓        | ✓          | ✓          | Documented session format; forks/branches; reported costs                                                                           |
+| Codex CLI   | supported         | ✓        | ✓          | ✓          | Rollout JSONL; cumulative token counts; current `exec_command`/`shell_command` and older command arrays                             |
+| OpenCode    | supported formats | ✓        | ✓          | ✓          | Native SQLite with WAL, and legacy JSON with separate part directories; tested with generated format fixtures                       |
 | Cursor      | **experimental**  | ✓        | partial    | ✓          | Live `store.db` and IDE agent transcripts; overlapping parent sessions prefer `store.db`. Usage is uncommon; plans are not indexed. |
 
 Markdown images do not load automatically. HTML reports are static, sandboxed previews with scripts and external resources blocked, including on direct navigation. Original report content remains available through the artifact JSON API. Interactive charts may not work in the preview.

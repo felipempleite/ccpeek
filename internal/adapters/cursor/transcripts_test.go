@@ -110,7 +110,7 @@ func TestParseTranscriptJSONL(t *testing.T) {
 	}
 	body := strings.Join([]string{
 		`{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Tuesday, Aug 4, 2026, 4:53 PM (UTC+2)</timestamp>\n<user_query>\nSpeed up CI\n</user_query>"}]}}`,
-		`{"role":"assistant","message":{"content":[{"type":"text","text":"On it."},{"type":"tool_use","name":"Read","input":{"path":"Makefile"}}]}}`,
+		`{"role":"assistant","message":{"content":[{"type":"text","text":"On it."},{"type":"tool_use","name":"Read","input":{"path":"Makefile"}},{"type":"tool_use","name":"Shell","input":{"command":"go test ./..."}},{"type":"tool_use","name":"Edit","input":{"file_path":"app.go","old_string":"old","new_string":"new"}}]}}`,
 		`{"role":"assistant","message":{"content":[{"type":"text","text":"Done."}]}}`,
 	}, "\n") + "\n"
 	path := filepath.Join(dir, sid+".jsonl")
@@ -156,8 +156,43 @@ func TestParseTranscriptJSONL(t *testing.T) {
 	if !slices.Equal(roles, want) {
 		t.Fatalf("roles = %v", roles)
 	}
-	if len(sink.ToolCalls) != 1 || sink.ToolCalls[0].Name != "Read" {
+	if len(sink.ToolCalls) != 3 || sink.ToolCalls[0].Name != "Read" {
 		t.Fatalf("tools = %+v", sink.ToolCalls)
+	}
+	if sink.ToolCalls[0].FilePath != "Makefile" || sink.ToolCalls[1].Command != "go test ./..." ||
+		sink.ToolCalls[2].FilePath != "app.go" || sink.ToolCalls[2].OldText != "old" || sink.ToolCalls[2].NewText != "new" {
+		t.Errorf("tool fields = %+v", sink.ToolCalls)
+	}
+}
+
+func TestParseTranscriptPrefersRecordedWorkspacePath(t *testing.T) {
+	root := t.TempDir()
+	sid := "abcdef01-2345-6789-abcd-ef0123456789"
+	dir := filepath.Join(root, "projects", "Users-demo-my-project", "agent-transcripts", sid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, sid+".jsonl")
+	body := strings.Join([]string{
+		`{"role":"assistant","message":{"content":"Starting"}}`,
+		`{"role":"user","message":{"content":"Workspace Path: /Users/demo/my-project\n\nFix it"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{
+		Root: agent.Root{Agent: Slug, Path: root}, Path: path, Kind: agent.SourceFile,
+	}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Sessions) != 1 || sink.Sessions[0].CWD != "/Users/demo/my-project" {
+		t.Fatalf("sessions = %+v", sink.Sessions)
+	}
+	for _, msg := range sink.Messages {
+		if msg.CWD != "/Users/demo/my-project" {
+			t.Errorf("message CWD = %q", msg.CWD)
+		}
 	}
 }
 
