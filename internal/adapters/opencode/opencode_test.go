@@ -41,7 +41,12 @@ func TestDiscoverEmitsOneSourcePerSession(t *testing.T) {
 	if want := filepath.Join(root.Path, "storage", "session", "proj9hash", "ses_oc001.json"); ref.Path != want {
 		t.Errorf("path = %q, want %q", ref.Path, want)
 	}
-	want := []string{filepath.Join(root.Path, "storage", "message", "ses_oc001")}
+	want := []string{
+		filepath.Join(root.Path, "storage", "message", "ses_oc001"),
+		filepath.Join(root.Path, "storage", "part", "msg_001"),
+		filepath.Join(root.Path, "storage", "part", "msg_002"),
+		filepath.Join(root.Path, "storage", "part", "msg_003"),
+	}
 	if !slices.Equal(ref.CompanionPaths, want) {
 		t.Errorf("companions = %v, want %v", ref.CompanionPaths, want)
 	}
@@ -63,7 +68,7 @@ func TestParseSessionDocument(t *testing.T) {
 		t.Fatalf("sessions = %d", len(sink.Sessions))
 	}
 	sess := sink.Sessions[0]
-	if sess.ExternalID != "ses_oc001" || sess.Title != "Refactor auth middleware" {
+	if sess.ExternalID != "ses_oc001" || sess.Title != "Refactor auth middleware" || !sess.TitleOverride {
 		t.Errorf("session = %+v", sess)
 	}
 	if sess.CWD != "/home/u/demo/api" {

@@ -2,6 +2,8 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -69,8 +71,8 @@ func TestParseMainSession(t *testing.T) {
 	if sess.CWD != "/home/u/demo/api" {
 		t.Errorf("cwd = %q (must come from header, not directory name)", sess.CWD)
 	}
-	if sess.Title != "rate limiting work" {
-		t.Errorf("title = %q, want session_info name", sess.Title)
+	if sess.Title != "rate limiting work" || !sess.TitleOverride {
+		t.Errorf("title = %q override=%v, want session_info name", sess.Title, sess.TitleOverride)
 	}
 	if len(sink.Relations) != 0 {
 		t.Errorf("relations = %v, want none for root session", sink.Relations)
@@ -90,6 +92,44 @@ func TestParseMainSession(t *testing.T) {
 		kinds[canon.KindCompaction] != 1 || kinds[canon.KindBranchPoint] != 1 ||
 		kinds[canon.KindInfo] != 1 {
 		t.Errorf("kind histogram = %v", kinds)
+	}
+}
+
+func TestSessionTitleSkipsSkillEnvelope(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "session.jsonl")
+	lines := []string{
+		`{"type":"session","id":"title-test","version":3,"cwd":"/tmp/demo","timestamp":"2026-08-22T10:00:00Z"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-08-22T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"<skill name=\"commit\">synthetic instructions</skill>"}]}}`,
+		`{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-08-22T10:00:02Z","message":{"role":"user","content":[{"type":"text","text":"explain the failing build"}]}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{
+		Root: agent.Root{Agent: Slug, Path: root}, Path: path, Kind: agent.SourceFile,
+	}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.Sessions[len(sink.Sessions)-1]
+	if got.Title != "explain the failing build" || got.TitleOverride {
+		t.Fatalf("session title = %q override=%v, want first real prompt", got.Title, got.TitleOverride)
+	}
+}
+
+func TestPiPromptTitleSkipsSkillEnvelope(t *testing.T) {
+	if got := piPromptTitle(`<skill name="commit">synthetic instructions</skill>`); got != "" {
+		t.Errorf("piPromptTitle() = %q, want empty", got)
+	}
+	if got := piPromptTitle("  explain the failing build  "); got != "explain the failing build" {
+		t.Errorf("real prompt title = %q", got)
+	}
+}
+
+func TestParseVersionIncludesCodemode(t *testing.T) {
+	if got := New().ParseVersion(); got != 11 {
+		t.Fatalf("ParseVersion() = %d, want 11", got)
 	}
 }
 
@@ -126,6 +166,58 @@ func TestParseUsageWithReportedCost(t *testing.T) {
 		if m.Model != "claude-sonnet-5" {
 			t.Errorf("model = %q, want model_change state applied", m.Model)
 		}
+	}
+}
+
+func TestModernMessageAndSummaryUsage(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "session.jsonl")
+	lines := []string{
+		`{"type":"session","id":"modern","version":3,"cwd":"/tmp/p","timestamp":"2026-08-21T10:00:00Z"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-08-21T10:00:01Z","message":{"role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol","content":[{"type":"text","text":"ok"}],"usage":{"input":10,"output":2,"cacheRead":3,"cacheWrite":4,"cost":{"total":0.5}}}}`,
+		`{"type":"compaction","id":"c1","parentId":"m1","timestamp":"2026-08-21T10:01:00Z","summary":"compact","usage":{"input":5,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.1}}}`,
+		`{"type":"branch_summary","id":"b1","parentId":"c1","timestamp":"2026-08-21T10:02:00Z","fromId":"m1","summary":"branch","usage":{"input":7,"output":2,"cacheRead":1,"cacheWrite":0,"cost":{"total":0.2}}}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{
+		Root: agent.Root{Agent: Slug, Path: root}, Path: path, Kind: agent.SourceFile,
+	}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Messages) != 3 {
+		t.Fatalf("messages = %d, want 3", len(sink.Messages))
+	}
+	for _, m := range sink.Messages {
+		if m.Provider != "openai-codex" || m.Model != "gpt-5.6-sol" {
+			t.Errorf("entry %s provider/model = %q/%q", m.ExternalID, m.Provider, m.Model)
+		}
+		if m.Usage == nil || m.Usage.ReportedCostUSD == nil {
+			t.Errorf("entry %s missing usage/cost", m.ExternalID)
+		}
+	}
+	if got := *sink.Messages[1].Usage.ReportedCostUSD; got != 0.1 {
+		t.Errorf("compaction cost = %v", got)
+	}
+	if got := *sink.Messages[2].Usage.ReportedCostUSD; got != 0.2 {
+		t.Errorf("branch summary cost = %v", got)
+	}
+}
+
+func TestModelOnlyMessageClearsStaleProvider(t *testing.T) {
+	provider, model := "openai-codex", "gpt-5.6-sol"
+	entry := entry{
+		Type: "message", ID: "m2",
+		Message: json.RawMessage(`{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"switched"}]}`),
+	}
+	message, _, ok := New().convertEntry(entry, 0, &canon.Session{}, &provider, &model)
+	if !ok {
+		t.Fatal("message did not convert")
+	}
+	if message.Provider != "" || provider != "" || message.Model != "claude-sonnet-5" || model != "claude-sonnet-5" {
+		t.Fatalf("message/state provider-model = %q/%q and %q/%q", message.Provider, message.Model, provider, model)
 	}
 }
 
@@ -239,5 +331,154 @@ func TestToolResultRoleNormalized(t *testing.T) {
 	// The fixture answers both tool calls.
 	if toolRoled != 2 {
 		t.Errorf("tool-roled messages = %d, want 2", toolRoled)
+	}
+}
+
+// A codemode call's script is its whole meaning, and the tools it ran
+// exist only in the result's nestedCalls record — without both, a session
+// that edits files through scripts shows no script and no file changes.
+func TestParseCodemodeScriptAndNestedCalls(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions", "--home-u-demo--")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"type":"session","version":3,"id":"cm-1","timestamp":"2026-10-08T20:00:00.000Z","cwd":"/home/u/demo"}`,
+		`{"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-08T20:00:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_cm","name":"codemode","arguments":{"code":"await tools.edit({path:\"a.go\",oldText:\"x\",newText:\"y\"});\nawait tools.bash({command:\"go test ./...\"});"}}]}}`,
+		`{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-10-08T20:00:02.000Z","message":{"role":"toolResult","toolCallId":"call_cm","toolName":"codemode","isError":false,"content":[{"type":"text","text":"Script completed"}],"nestedCalls":{"complete":true,"calls":[` +
+			`{"id":"call_cm/1","name":"edit","status":"ok","arguments":{"path":"a.go","oldText":"x","newText":"y"},"durationMs":3},` +
+			`{"id":"call_cm/2","name":"bash","status":"error","arguments":{"command":"go test ./..."},"durationMs":90,"error":"exit 1"}]}}}`,
+	}
+	path := filepath.Join(dir, "2026-10-08T20-00-00-000Z_cm-1.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	src := agent.SourceRef{Path: path, Root: agent.Root{Agent: Slug, Path: root}}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if len(sink.ToolCalls) != 3 {
+		t.Fatalf("tool calls = %d, want 3 (script + 2 nested)", len(sink.ToolCalls))
+	}
+	script, edit, bash := sink.ToolCalls[0], sink.ToolCalls[1], sink.ToolCalls[2]
+	if script.Kind != canon.ToolScript || !strings.Contains(script.Command, "tools.edit") {
+		t.Errorf("script = %s/%q, want script kind carrying the code", script.Kind, script.Command)
+	}
+	resultSeq := sink.Messages[1].Seq
+	if edit.Kind != canon.ToolFileEdit || edit.FilePath != "a.go" || edit.NewText != "y" ||
+		edit.ResultStatus != "ok" || edit.MessageSeq != resultSeq || edit.ExternalID != "call_cm/1" {
+		t.Errorf("nested edit = %+v", edit)
+	}
+	if bash.Kind != canon.ToolShell || bash.Command != "go test ./..." ||
+		bash.ResultStatus != "error" || bash.ResultExcerpt != "exit 1" {
+		t.Errorf("nested bash = %+v", bash)
+	}
+}
+
+// Pi marks a failed or aborted turn on the assistant message itself; the
+// free-text error is classed like Claude's so both agents group together.
+func TestStopReasonsBecomeEvents(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions", "--w--")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"type":"session","version":3,"id":"ev-1","timestamp":"2026-10-08T20:00:00.000Z","cwd":"/w"}`,
+		`{"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-08T20:00:01.000Z","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Rate limit reached for gpt-6"}}`,
+		`{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-10-08T20:00:02.000Z","message":{"role":"assistant","content":[],"stopReason":"aborted","errorMessage":"Operation aborted"}}`,
+		`{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-10-08T20:00:03.000Z","message":{"role":"assistant","content":[],"stopReason":"stop"}}`,
+	}
+	path := filepath.Join(dir, "2026-10-08T20-00-00-000Z_ev-1.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Path: path, Root: agent.Root{Agent: Slug, Path: root}}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Events) != 2 {
+		t.Fatalf("events = %+v, want error + abort", sink.Events)
+	}
+	if e := sink.Events[0]; e.Kind != canon.EventAPIError || e.Label != "rate_limit" || e.MessageSeq != 0 {
+		t.Errorf("error event = %+v", e)
+	}
+	if e := sink.Events[1]; e.Kind != canon.EventAborted || e.MessageSeq != 1 {
+		t.Errorf("abort event = %+v", e)
+	}
+}
+
+// Pi's compaction entries record how full the context was; each becomes a
+// compaction event anchored to its transcript entry.
+func TestCompactionEntryBecomesEvent(t *testing.T) {
+	sink := parseFixture(t, "2026-07-01T10-00-00_"+mainSession+".jsonl")
+	var found []canon.SessionEvent
+	for _, e := range sink.Events {
+		if e.Kind == canon.EventCompaction {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 || !strings.Contains(string(found[0].Payload), `"preTokens":9888`) {
+		t.Errorf("compaction events = %+v, want one at 9888 tokens", found)
+	}
+}
+
+// Older Pi sessions record the thinking level only as change entries; the
+// level in effect rides on each assistant turn, and a level stamped on
+// the turn itself wins.
+func TestThinkingLevelBecomesEffort(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions", "--w--")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"type":"session","version":3,"id":"eff-1","timestamp":"2026-10-08T20:00:00.000Z","cwd":"/w"}`,
+		`{"type":"thinking_level_change","id":"t1","parentId":null,"timestamp":"2026-10-08T20:00:00.500Z","thinkingLevel":"high"}`,
+		`{"type":"message","id":"m1","parentId":"t1","timestamp":"2026-10-08T20:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}`,
+		`{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-10-08T20:00:02.000Z","message":{"role":"assistant","thinkingLevel":"max","content":[{"type":"text","text":"b"}]}}`,
+	}
+	path := filepath.Join(dir, "2026-10-08T20-00-00-000Z_eff-1.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Path: path, Root: agent.Root{Agent: Slug, Path: root}}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Messages) != 2 || sink.Messages[0].Effort != "high" || sink.Messages[1].Effort != "max" {
+		t.Errorf("efforts = %+v", sink.Messages)
+	}
+}
+
+// Current Pi sends every replacement of an edit in one edits[] array; the
+// call must still carry its old and new text for the diff view, one
+// replacement after another.
+func TestMultiEditCarriesEveryReplacement(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions", "--w--")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lines := []string{
+		`{"type":"session","version":3,"id":"me-1","timestamp":"2026-10-08T20:00:00.000Z","cwd":"/w"}`,
+		`{"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-08T20:00:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"edit","arguments":{"path":"a.go","edits":[{"oldText":"one","newText":"uno"},{"oldText":"two","newText":"dos"}]}}]}}`,
+	}
+	path := filepath.Join(dir, "2026-10-08T20-00-00-000Z_me-1.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Path: path, Root: agent.Root{Agent: Slug, Path: root}}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d", len(sink.ToolCalls))
+	}
+	if tc := sink.ToolCalls[0]; tc.OldText != "one\n⋯\ntwo" || tc.NewText != "uno\n⋯\ndos" {
+		t.Errorf("old/new = %q / %q", tc.OldText, tc.NewText)
 	}
 }

@@ -238,6 +238,16 @@ func TestToolSchemasForbidUndeclaredArguments(t *testing.T) {
 	}
 }
 
+func TestCostModeIsNotAdvertised(t *testing.T) {
+	for _, tool := range buildToolDefs() {
+		schema := tool["inputSchema"].(map[string]any)
+		props := schema["properties"].(map[string]any)
+		if _, ok := props["cost_mode"]; ok {
+			t.Fatalf("tool %v still advertises cost_mode", tool["name"])
+		}
+	}
+}
+
 // A tools/call with no params at all answered "invalid tool call params:
 // unexpected end of JSON input" — the JSON decoder's complaint, useless
 // to the caller. It must say what tools/call needs. A tool that takes no

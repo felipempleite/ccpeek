@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, useSearch } from "@tanstack/react-router";
 import {
   api,
-  fmtCostExact,
   fmtCount,
   fmtTokens,
   parityApi,
@@ -43,7 +42,12 @@ const isGroup = (v: string | undefined): v is Group =>
 function pivotSearch(
   group: string,
   value: string,
-  active: { agent: string; model: string; since: string; until: string },
+  active: {
+    agent: string;
+    model: string;
+    since: string;
+    until: string;
+  },
 ): Record<string, string> {
   const search: Record<string, string> = {};
   if (active.agent) search.agent = active.agent;
@@ -148,7 +152,14 @@ export function UsagePage() {
   // by construction (the old fixed 1000 silently truncated past it).
   const { data, isLoading, error } = useQuery({
     queryKey: ["usage", group, since, until, agent, model],
-    queryFn: () => api.usage({ group, since, until, agent, model }),
+    queryFn: () =>
+      api.usage({
+        group,
+        since,
+        until,
+        agent,
+        model,
+      }),
     enabled: !isBlocks,
     placeholderData: (prev) => prev,
   });
@@ -174,7 +185,7 @@ export function UsagePage() {
   const total = isBlocks
     ? blockRows.reduce((acc, b) => acc + b.costUSD, 0)
     : rows.reduce((acc, r) => acc + r.costUSD, 0);
-  const anyUnpriced = isBlocks
+  const anyIncomplete = isBlocks
     ? blockRows.some((b) => (b.unpricedTokens ?? 0) > 0)
     : rows.some((r) => r.hasUnpriced);
 
@@ -188,11 +199,7 @@ export function UsagePage() {
         title="Usage"
         lede={
           <span className="flex items-baseline gap-1.5">
-            <Money
-              usd={total}
-              unpriced={anyUnpriced ? 1 : undefined}
-              className="text-sm"
-            />
+            <Money usd={total} incomplete={anyIncomplete} className="text-sm" />
             <span className="font-mono text-meta text-ink-faint">
               {isBlocks ? "across shown windows" : "over the current filters"}
             </span>
@@ -290,7 +297,12 @@ function UsageTable({
 }: {
   rows: UsageRow[];
   group: Group;
-  filters: { agent: string; model: string; since: string; until: string };
+  filters: {
+    agent: string;
+    model: string;
+    since: string;
+    until: string;
+  };
 }) {
   // Sorting: null keeps the server order (day desc / cost desc); a click
   // cycles asc↔desc per column.
@@ -368,7 +380,7 @@ function UsageTable({
                   {r.hasUnpriced && (
                     <span
                       className="ml-2 text-warn"
-                      title="Contains unpriced tokens"
+                      title="Contains tokens without a resolvable rate"
                     >
                       ●
                     </span>
@@ -386,9 +398,9 @@ function UsageTable({
                 <td className="px-4 py-2 text-right">
                   <Money
                     usd={r.costUSD}
-                    unpriced={r.hasUnpriced ? 1 : undefined}
+                    incomplete={Boolean(r.hasUnpriced)}
                     className="text-xs"
-                    title={`reported ${fmtCostExact(r.costReportedUSD)} · estimated ${fmtCostExact(r.costEstimatedUSD)}`}
+                    title={`${r.costUSDExact} USD · reported $${r.costReportedUSDExact} · estimated $${r.costEstimatedUSDExact}`}
                   />
                 </td>
                 <td
@@ -400,9 +412,11 @@ function UsageTable({
                         {groupLabel(group, r.group) || group}
                       </span>
                       <br />
-                      reported {fmtCostExact(r.costReportedUSD)}
+                      exact ${r.costUSDExact}
                       <br />
-                      estimated {fmtCostExact(r.costEstimatedUSD)}
+                      reported ${r.costReportedUSDExact}
+                      <br />
+                      estimated ${r.costEstimatedUSDExact}
                     </>,
                   )}
                 >
@@ -565,7 +579,7 @@ function BlocksTable({
                 {(b.unpricedTokens ?? 0) > 0 && (
                   <span
                     className="ml-2 text-warn"
-                    title="Contains unpriced tokens"
+                    title="Contains tokens without a resolvable rate"
                   >
                     ●
                   </span>
@@ -580,8 +594,9 @@ function BlocksTable({
               <td className="px-4 py-2 text-right">
                 <Money
                   usd={b.costUSD}
-                  unpriced={b.unpricedTokens}
+                  incomplete={(b.unpricedTokens ?? 0) > 0}
                   className="text-xs"
+                  title={`${b.costUSDExact} USD`}
                 />
               </td>
               <td className="px-4 py-2">

@@ -61,7 +61,19 @@ type SourceRef struct {
 	Path           string
 	Kind           SourceKind
 	CompanionPaths []string
+	// HistorySnapshot marks a whole prompt-history source, including an empty
+	// file. Only these sources may replace previously indexed history rows.
+	HistorySnapshot bool
 }
+
+// IncompleteDiscovery accompanies usable sources when some paths could not
+// be inspected. Callers may ingest those sources but must not prune this root.
+// Issues retain per-path diagnostics; warning severity does not imply completeness.
+type IncompleteDiscovery struct {
+	Issues []canon.Issue
+}
+
+func (*IncompleteDiscovery) Error() string { return "source discovery is incomplete" }
 
 // RecordSink receives canonical records during Parse. Implementations
 // handle persistence, dedupe, and link resolution; adapters just emit.
@@ -71,6 +83,7 @@ type RecordSink interface {
 	Message(canon.Message) error
 	ToolCall(canon.ToolCall) error
 	ToolResult(canon.ToolResult) error
+	SessionEvent(canon.SessionEvent) error
 	Artifact(canon.Artifact) error
 	ArtifactLink(canon.ArtifactLink) error
 	History(canon.HistoryEntry) error
@@ -92,6 +105,8 @@ type Adapter interface {
 	// Discover enumerates indexable sources under a root. It must tolerate
 	// partially-missing layouts (fresh installs, other agent versions) and
 	// return what it finds rather than erroring on absent subdirectories.
+	// IncompleteDiscovery permits returning valid sources alongside diagnostics;
+	// any other error means the returned sources must not be used.
 	Discover(ctx context.Context, root Root) ([]SourceRef, error)
 
 	// Parse reads one source and emits canonical records into the sink.
@@ -135,6 +150,14 @@ type TailState struct {
 // (it shrank, or the already-parsed prefix was rewritten). The pipeline
 // falls back to a full re-parse of the source.
 var ErrTailInvalid = errors.New("source cannot be resumed from its cursor")
+
+// ParseVersioner is an optional adapter capability. Bumping the version
+// forces unchanged source bytes through a full parse once, so newly captured
+// fields can be recovered without pretending the file changed. Version 1 is
+// the default for adapters that do not implement it.
+type ParseVersioner interface {
+	ParseVersion() int
+}
 
 // TailParser is an optional adapter capability for append-only sources
 // (e.g. Claude Code's session JSONL): parse only the bytes added since

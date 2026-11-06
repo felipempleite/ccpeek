@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +41,6 @@ const (
 // one map entry.
 func fixtureService(t *testing.T, slugs ...canon.AgentSlug) *Service {
 	t.Helper()
-	store, table := newStore(t)
 	known := map[canon.AgentSlug]agent.Adapter{
 		claude.Slug:   claude.New(),
 		pi.Slug:       pi.New(),
@@ -59,6 +61,14 @@ func fixtureService(t *testing.T, slugs ...canon.AgentSlug) *Service {
 		adapters = append(adapters, a)
 		roots[slug] = []string{dir}
 	}
+	return ingestRoots(t, roots, adapters...)
+}
+
+// ingestRoots ingests the given agent roots, and nothing from the
+// developer's machine, into a fresh store.
+func ingestRoots(t *testing.T, roots map[canon.AgentSlug][]string, adapters ...agent.Adapter) *Service {
+	t.Helper()
+	store, table := newStore(t)
 	if _, err := ingest.New(store, table, adapters...).Run(context.Background(), ingest.Options{
 		ConfigRoots: roots,
 		Getenv:      func(string) string { return "" },
@@ -320,6 +330,93 @@ func TestSearch(t *testing.T) {
 // SUBSET of output (never re-added). If either side regresses — dropped
 // OpenCode reasoning or double-counted Codex reasoning — the exact
 // token totals here break.
+func TestReportedZeroAndPartialPricingAgreeAcrossSurfaces(t *testing.T) {
+	ctx := context.Background()
+	store, err := db.Open(ctx, filepath.Join(t.TempDir(), "v2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	table, err := pricing.Parse([]byte(`{
+		"source":"test","fetched_at":"2026-08-21T00:00:00Z",
+		"models":{"provider/model-a":{"input":2,"output":3}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+	w, err := store.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := w.UpsertSession(canon.Session{
+		Agent: "opencode", ExternalID: "zero", CWD: "/tmp/project",
+		CreatedAt: at, ModifiedAt: at,
+	}, "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0.0
+	if err := w.InsertMessage(id, "opencode", canon.Message{
+		Seq: 0, Role: canon.RoleAssistant, CreatedAt: at,
+		Provider: "provider", Model: "model-a",
+		Usage: &canon.Usage{
+			InputTokens: 10, CacheReadTokens: 5, ReportedCostUSD: &zero,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegenerateWorkspaces(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegenerateRollups(ctx, table); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(store, table)
+
+	sessions, err := svc.Sessions(ctx, SessionsFilter{})
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %+v err=%v", sessions, err)
+	}
+	// Input is priced (10×2); absent cache-read pricing leaves five tokens
+	// unpriced. The raw reported zero falls through rather than suppressing both.
+	if sessions[0].CostUSD != 20 || sessions[0].UnpricedTokens != 5 ||
+		sessions[0].UnpricedTokenTypes == nil || sessions[0].UnpricedTokenTypes.CacheRead != 5 {
+		t.Errorf("session cost provenance = %+v", sessions[0])
+	}
+	blocks, err := svc.Blocks(ctx, "", 10)
+	if err != nil || len(blocks) != 1 {
+		t.Fatalf("blocks = %+v err=%v", blocks, err)
+	}
+	if blocks[0].CostUSD != 20 || blocks[0].UnpricedTokens != 5 {
+		t.Errorf("block = %+v", blocks[0])
+	}
+	usage, err := svc.Usage(ctx, UsageFilter{GroupBy: "day"})
+	if err != nil || len(usage) != 1 {
+		t.Fatalf("usage = %+v err=%v", usage, err)
+	}
+	if usage[0].CostUSD != 20 || usage[0].CostReportedUSD != 0 ||
+		usage[0].CostEstimatedUSD != 20 || !usage[0].HasUnpriced ||
+		usage[0].UnpricedTokenTypes == nil || usage[0].UnpricedTokenTypes.CacheRead != 5 {
+		t.Errorf("usage row = %+v", usage[0])
+	}
+}
+
+func TestPricingDiagnostics(t *testing.T) {
+	svc := newService(t)
+	info, err := svc.Pricing(context.Background(), "anthropic/claude-sonnet-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Fingerprint == "" || info.Source == "" || info.Algorithm == "" ||
+		!info.Resolved || info.ResolvedModel == "" || info.Rates == nil {
+		t.Errorf("pricing diagnostics = %+v", info)
+	}
+}
+
 func TestReasoningSemanticsAcrossProviders(t *testing.T) {
 	svc := fixtureService(t, codex.Slug, opencode.Slug)
 	sessions, err := svc.Sessions(context.Background(), SessionsFilter{})
@@ -784,6 +881,76 @@ func newStore(t *testing.T) (*db.Store, *pricing.Table) {
 	return store, table
 }
 
+func TestAutomaticCostAgreesAcrossSurfaces(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newStore(t)
+	table, err := pricing.Parse([]byte(`{
+		"source":"test","fetched_at":"2026-01-01T00:00:00Z",
+		"models":{"model":{"input":9,"output":9,"tiers":[{"above_input_tokens":4,"input":2}]}},
+		"history":{"model":[{"effective_from":"2026-01-01","effective_to":"2027-01-01","rate":{"input":1,"output":1}}]}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := store.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	id, err := w.UpsertSession(canon.Session{Agent: "claude-code", ExternalID: "automatic-cost", CreatedAt: at, ModifiedAt: at}, "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reported := 7.0
+	for seq, usage := range []canon.Usage{{InputTokens: 2, ReportedCostUSD: &reported}, {InputTokens: 5}} {
+		if err := w.InsertMessage(id, "claude-code", canon.Message{Seq: seq, Role: canon.RoleAssistant, CreatedAt: at.Add(time.Duration(seq) * time.Minute), Model: "model", Usage: &usage}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegenerateWorkspaces(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RegenerateRollups(ctx, table); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(store, table)
+
+	sessions, err := svc.Sessions(ctx, SessionsFilter{})
+	if err != nil || len(sessions) != 1 {
+		t.Fatalf("sessions = %+v, %v", sessions, err)
+	}
+	detail, err := svc.Session(ctx, "claude-code", "automatic-cost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := svc.Blocks(ctx, "", 10)
+	if err != nil || len(blocks) != 1 {
+		t.Fatalf("blocks = %+v, %v", blocks, err)
+	}
+	usage, err := svc.Usage(ctx, UsageFilter{GroupBy: "day"})
+	if err != nil || len(usage) != 1 {
+		t.Fatalf("usage = %+v, %v", usage, err)
+	}
+	stats, err := svc.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for surface, got := range map[string]string{
+		"sessions": sessions[0].CostUSDExact,
+		"session":  detail.CostUSDExact,
+		"blocks":   blocks[0].CostUSDExact,
+		"usage":    usage[0].CostUSDExact,
+		"stats":    stats.CostUSDExact,
+	} {
+		if got != "17" {
+			t.Errorf("%s exact cost = %q, want 17", surface, got)
+		}
+	}
+}
+
 // Session counts must stay true distinct counts per group after the
 // switch to the rollup side table — a session spanning two models on one
 // day is ONE session that day, not two, and one spanning two days is one
@@ -1180,5 +1347,385 @@ func TestProjectFilterCanonicalizesTheCallerPath(t *testing.T) {
 	// A genuinely different directory still matches nothing.
 	if got, err := svc.Sessions(ctx, SessionsFilter{Project: "/home/u/other"}); err != nil || len(got) != 0 {
 		t.Errorf("unrelated project matched %d sessions (err %v), want 0", len(got), err)
+	}
+}
+
+// A subagent's turns are billed, so they must count — but as their own
+// sessions, hidden from the list by default and totalled on the parent,
+// including subagents spawned by subagents.
+func TestSubagentSessionsRollUpUnderTheirParent(t *testing.T) {
+	const parent = "22222222-aaaa-bbbb-cccc-222222222222"
+	root := t.TempDir()
+	sessDir := filepath.Join(root, "projects", "-w", parent)
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(sessDir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	turn := func(uuid, msgID string, ts string) string {
+		return `{"type":"user","sessionId":"` + parent + `","uuid":"` + uuid + `u","timestamp":"` + ts + `","message":{"role":"user","content":"go"}}` + "\n" +
+			`{"type":"assistant","sessionId":"` + parent + `","uuid":"` + uuid + `a","requestId":"req_` + msgID + `","timestamp":"` + ts + `",` +
+			`"message":{"id":"` + msgID + `","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],` +
+			`"usage":{"input_tokens":1000,"output_tokens":100}}}` + "\n"
+	}
+	write("../"+parent+".jsonl", turn("p", "msg_p", "2026-10-01T10:00:00Z"))
+	write("subagents/agent-a1.jsonl", turn("a", "msg_a", "2026-10-01T10:01:00Z"))
+	write("subagents/agent-a1.meta.json", `{"agentType":"Explore","description":"Map it"}`)
+	write("subagents/workflows/wf_1/agent-b2.jsonl", turn("b", "msg_b", "2026-10-01T10:02:00Z"))
+	write("subagents/workflows/wf_1/agent-b2.meta.json", `{"agentType":"workflow-subagent","parentAgentId":"a1"}`)
+
+	s := claudeRootService(t, root)
+	ctx := context.Background()
+
+	listed, err := s.Sessions(ctx, SessionsFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != parent || listed[0].SubagentCount != 1 {
+		t.Fatalf("default list = %+v, want only the parent with 1 direct subagent", listed)
+	}
+	all, err := s.Sessions(ctx, SessionsFilter{Subagents: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("subagents=true listed %d sessions, want 3", len(all))
+	}
+
+	detail, err := s.Session(ctx, string(claude.Slug), parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detail.Subagents) != 1 || detail.Subagents[0].ID != "agent-a1" ||
+		detail.Subagents[0].SubagentType != "Explore" || detail.Subagents[0].Title != "Map it" {
+		t.Fatalf("direct subagents = %+v", detail.Subagents)
+	}
+	total := detail.SubagentTotal
+	if total == nil || total.Sessions != 2 || total.Tokens.Input != 2000 ||
+		total.CostUSD <= 0 || total.CostUSD != 2*detail.CostUSD {
+		t.Fatalf("subagent total = %+v (own cost %v), want both descendants at twice the parent's cost", total, detail.CostUSD)
+	}
+}
+
+// claudeRootService ingests a Claude Code root built by a test.
+// claudeSessionsService ingests Claude sessions (id → JSONL body) from one
+// project directory.
+func claudeSessionsService(t *testing.T, sessions map[string]string) *Service {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "projects", "-w")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for id, body := range sessions {
+		if err := os.WriteFile(filepath.Join(dir, id+".jsonl"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return claudeRootService(t, root)
+}
+
+func claudeRootService(t *testing.T, root string) *Service {
+	t.Helper()
+	return ingestRoots(t, map[canon.AgentSlug][]string{claude.Slug: {root}}, claude.New())
+}
+
+// A resumed session names its parent and the parent entry it branched
+// after, so either side can jump to the branch point.
+func TestResumedSessionRelationCarriesBranchSeq(t *testing.T) {
+	const (
+		parent = "55555555-0000-0000-0000-000000000001"
+		child  = "55555555-0000-0000-0000-000000000002"
+	)
+	line := func(session, uuid string) string {
+		return `{"type":"user","uuid":"` + uuid + `","sessionId":"` + session +
+			`","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}` + "\n"
+	}
+	s := claudeSessionsService(t, map[string]string{
+		parent: line(parent, "p0") + line(parent, "p1") + line(parent, "p2"),
+		child:  line(parent, "p0") + line(parent, "p1") + line(child, "c0"),
+	})
+	ctx := context.Background()
+	for id, want := range map[string]string{child: "out", parent: "in"} {
+		d, err := s.Session(ctx, string(claude.Slug), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(d.Relations) != 1 || d.Relations[0].Kind != "resumed_from" ||
+			d.Relations[0].Direction != want || d.Relations[0].AtSeq == nil || *d.Relations[0].AtSeq != 1 {
+			t.Errorf("%s relations = %+v, want one %s resumed_from edge at parent seq 1", id, d.Relations, want)
+		}
+	}
+}
+
+// Errors recorded in transcripts surface as events the Insights page can
+// count by class and list with their transcript anchor, beside per-tool
+// failure counts.
+func TestErrorEventsAndToolFailuresAggregate(t *testing.T) {
+	const id = "88888888-0000-0000-0000-000000000001"
+	head := `"sessionId":"` + id + `","timestamp":"2026-10-01T10:00:00Z",`
+	body := `{"type":"assistant",` + head + `"uuid":"a","isApiErrorMessage":true,"apiErrorStatus":429,"error":"rate_limit","message":{"id":"x1","role":"assistant","content":[{"type":"text","text":"limit"}]}}` + "\n" +
+		`{"type":"assistant",` + head + `"uuid":"b","isApiErrorMessage":true,"error":"server_error","message":{"id":"x2","role":"assistant","content":[{"type":"text","text":"boom"}]}}` + "\n" +
+		`{"type":"assistant",` + head + `"uuid":"c","message":{"id":"x3","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"false"}}]}}` + "\n" +
+		`{"type":"user",` + head + `"uuid":"d","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"exit 1"}]}}` + "\n"
+	s := claudeSessionsService(t, map[string]string{id: body})
+	ctx := context.Background()
+
+	stats, err := s.EventStats(ctx, EventStatsFilter{Kind: "api_error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 2 || stats[0].Count != 1 || stats[0].Sessions != 1 {
+		t.Errorf("api_error by label = %+v, want rate_limit and server_error once each", stats)
+	}
+	events, err := s.Events(ctx, EventsFilter{Agent: string(claude.Slug), Session: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].SessionID != id {
+		t.Errorf("session events = %+v", events)
+	}
+	tools, err := s.ToolStats(ctx, ToolStatsFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Name != "Bash" || tools[0].Calls != 1 || tools[0].Errors != 1 {
+		t.Errorf("tool stats = %+v, want Bash 1 call 1 error", tools)
+	}
+}
+
+// A tool's run time is its result's arrival minus its call, to the
+// millisecond (stored timestamps are second-precision text), and a turn's
+// recorded wall time lands as a turn event.
+func TestToolAndTurnTiming(t *testing.T) {
+	const id = "aaaaaaaa-0000-0000-0000-000000000009"
+	head := func(ts string) string { return `"sessionId":"` + id + `","timestamp":"` + ts + `",` }
+	body := `{"type":"assistant",` + head("2026-10-01T10:00:00.000Z") + `"uuid":"a","message":{"id":"m1","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 1"}}]}}` + "\n" +
+		`{"type":"user",` + head("2026-10-01T10:00:01.250Z") + `"uuid":"b","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}` + "\n" +
+		`{"type":"system","subtype":"turn_duration","durationMs":21758,"messageCount":3,` + head("2026-10-01T10:00:02.000Z") + `"uuid":"c"}` + "\n"
+	s := claudeSessionsService(t, map[string]string{id: body})
+	ctx := context.Background()
+	tools, err := s.ToolStats(ctx, ToolStatsFilter{Sort: "avg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tools) != 1 || tools[0].Timed != 1 || tools[0].AvgMs != 1250 || tools[0].MaxMs != 1250 {
+		t.Errorf("tool timing = %+v, want Bash at exactly 1250ms", tools)
+	}
+	turns, err := s.Events(ctx, EventsFilter{Kind: "turn", Sort: "duration"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(turns) != 1 || turns[0].DurationMs != 21758 {
+		t.Errorf("turns = %+v, want one 21758ms turn", turns)
+	}
+}
+
+// Context fill is the prompt each request sent (input plus cache reads and
+// writes); a compaction lands between the requests it separates.
+func TestContextFillAndCompactions(t *testing.T) {
+	const id = "bbbbbbbb-0000-0000-0000-00000000000c"
+	head := `"sessionId":"` + id + `","timestamp":"2026-10-01T10:00:00Z",`
+	req := func(uuid, msgID string, input, cacheRead int) string {
+		return `{"type":"assistant",` + head + `"uuid":"` + uuid + `","requestId":"r` + msgID + `","message":{"id":"` + msgID +
+			`","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":` +
+			strconv.Itoa(input) + `,"cache_read_input_tokens":` + strconv.Itoa(cacheRead) + `,"output_tokens":10}}}` + "\n"
+	}
+	body := req("a", "m1", 100, 150000) +
+		`{"type":"system","subtype":"compact_boundary","content":"Conversation compacted",` + head + `"uuid":"c","compactMetadata":{"trigger":"auto","preTokens":150100,"postTokens":9000}}` + "\n" +
+		req("b", "m2", 100, 9000)
+	s := claudeSessionsService(t, map[string]string{id: body})
+	got, err := s.Context(context.Background(), string(claude.Slug), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Points) != 2 || got.Points[0].PromptTokens != 150100 || got.Points[1].PromptTokens != 9100 {
+		t.Errorf("points = %+v", got.Points)
+	}
+	if len(got.Compactions) != 1 || got.Compactions[0].Label != "auto" || got.Compactions[0].MessageSeq != 1 {
+		t.Errorf("compactions = %+v", got.Compactions)
+	}
+}
+
+// Every hook run is an attachment line; runs aggregate per command with
+// their failures, and failing runs list on their own. Hook output is
+// never stored.
+func TestHookRunsAggregatePerCommand(t *testing.T) {
+	const id = "cccccccc-0000-0000-0000-00000000000d"
+	head := `"sessionId":"` + id + `","timestamp":"2026-10-01T10:00:00Z",`
+	hook := func(uuid, typ, command string, exit string, ms int) string {
+		return `{"type":"attachment",` + head + `"uuid":"` + uuid + `","attachment":{"type":"` + typ + `","hookEvent":"PreToolUse","hookName":"PreToolUse:Bash","command":"` +
+			command + `","exitCode":` + exit + `,"durationMs":` + strconv.Itoa(ms) + `,"stdout":"SECRET-OUTPUT","stderr":""}}` + "\n"
+	}
+	body := `{"type":"user",` + head + `"uuid":"u","message":{"role":"user","content":"go"}}` + "\n" +
+		hook("h1", "hook_success", "lint.sh", "0", 40) + hook("h2", "hook_success", "lint.sh", "0", 60) +
+		hook("h3", "hook_success", "missing.sh", "127", 5) +
+		`{"type":"attachment",` + head + `"uuid":"h4","attachment":{"type":"hook_blocking_error","hookEvent":"Stop","hookName":"Stop","blockingError":{}}}` + "\n"
+	s := claudeSessionsService(t, map[string]string{id: body})
+	ctx := context.Background()
+	stats, err := s.EventStats(ctx, EventStatsFilter{Kind: "hook", GroupBy: "detail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byCommand := map[string]EventStat{}
+	for _, st := range stats {
+		byCommand[st.Group] = st
+	}
+	if lint := byCommand["lint.sh"]; lint.Count != 2 || lint.Failures != 0 || lint.AvgMs != 50 {
+		t.Errorf("lint.sh = %+v, want 2 runs, no failures, 50ms average", lint)
+	}
+	if missing := byCommand["missing.sh"]; missing.Failures != 1 {
+		t.Errorf("missing.sh = %+v, want 1 failure", missing)
+	}
+	failing, err := s.Events(ctx, EventsFilter{Kind: "hook", Status: "error,blocked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failing) != 2 {
+		t.Errorf("failing hooks = %+v, want the 127 and the block", failing)
+	}
+	all, _ := s.Events(ctx, EventsFilter{Kind: "hook"})
+	for _, e := range all {
+		if strings.Contains(e.Detail+string(e.Payload), "SECRET-OUTPUT") {
+			t.Errorf("hook output stored: %+v", e)
+		}
+	}
+}
+
+// An edit's size comes from its structured patch, a new file's from its
+// content; both roll up per file and onto the session.
+func TestFileChangeLinesRollUp(t *testing.T) {
+	const id = "dddddddd-0000-0000-0000-00000000000e"
+	head := `"sessionId":"` + id + `","timestamp":"2026-10-01T10:00:00Z",`
+	call := func(uuid, tool, name, path string) string {
+		return `{"type":"assistant",` + head + `"uuid":"` + uuid + `","message":{"id":"m` + uuid + `","role":"assistant","content":[{"type":"tool_use","id":"` + tool + `","name":"` + name + `","input":{"file_path":"` + path + `"}}]}}` + "\n"
+	}
+	result := func(uuid, tool, payload string) string {
+		return `{"type":"user",` + head + `"uuid":"` + uuid + `","toolUseResult":` + payload + `,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + tool + `","content":"ok"}]}}` + "\n"
+	}
+	body := call("a", "t1", "Edit", "/w/a.go") +
+		result("b", "t1", `{"filePath":"/w/a.go","structuredPatch":[{"oldStart":1,"oldLines":2,"newStart":1,"newLines":3,"lines":[" keep","-old","+new","+more"]}]}`) +
+		call("c", "t2", "Write", "/w/b.go") +
+		result("d", "t2", `{"type":"create","filePath":"/w/b.go","content":"one\ntwo\nthree\n","structuredPatch":[]}`) +
+		call("e", "t3", "Read", "/w/a.go") +
+		result("f", "t3", `{"type":"text","file":{"filePath":"/w/a.go"}}`)
+	s := claudeSessionsService(t, map[string]string{id: body})
+	ctx := context.Background()
+	files, err := s.Changes(ctx, ChangesFilter{GroupBy: "file"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]ChangeRow{}
+	for _, f := range files {
+		got[f.Group] = f
+	}
+	if len(files) != 2 || got["/w/a.go"].Added != 2 || got["/w/a.go"].Removed != 1 || got["/w/b.go"].Added != 3 {
+		t.Errorf("changes by file = %+v", files)
+	}
+	d, err := s.Session(ctx, string(claude.Slug), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Lines == nil || d.Lines.Added != 5 || d.Lines.Removed != 1 || d.Lines.Files != 2 {
+		t.Errorf("session lines = %+v", d.Lines)
+	}
+}
+
+// Agents that pass relative paths would merge every repository's README.md
+// into one row; changed files resolve against the session's directory.
+func TestChangedFilesResolveAgainstSessionCWD(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions", "--w--")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, cwd := range []string{"/repo/one", "/repo/two"} {
+		id := "rel-" + strconv.Itoa(i)
+		lines := []string{
+			`{"type":"session","version":3,"id":"` + id + `","timestamp":"2026-10-08T20:00:00.000Z","cwd":"` + cwd + `"}`,
+			`{"type":"message","id":"m1","parentId":null,"timestamp":"2026-10-08T20:00:01.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"write","arguments":{"path":"README.md","content":"hi\n"}}]}}`,
+		}
+		if err := os.WriteFile(filepath.Join(dir, "2026-10-08T20-00-00-000Z_"+id+".jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := ingestRoots(t, map[canon.AgentSlug][]string{pi.Slug: {root}}, pi.New())
+	files, err := s.Changes(context.Background(), ChangesFilter{GroupBy: "file"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || files[0].Group == files[1].Group || !strings.HasPrefix(files[0].Group, "/repo/") {
+		t.Errorf("files = %+v, want /repo/one/README.md and /repo/two/README.md apart", files)
+	}
+}
+
+// Effort splits a session's requests and cost by the level each turn ran
+// at — a per-turn override beats the session setting — and the split adds
+// up to the session's own cost.
+func TestEffortSplitsCostByLevel(t *testing.T) {
+	const id = "eeeeeeee-0000-0000-0000-00000000000f"
+	req := func(uuid, effort string) string {
+		return `{"type":"assistant","sessionId":"` + id + `","timestamp":"2026-10-01T10:00:00Z","uuid":"` + uuid + `","requestId":"r` + uuid + `",` + effort +
+			`"message":{"id":"m` + uuid + `","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"output_tokens":100}}}` + "\n"
+	}
+	body := req("a", `"effort":"high",`) + req("b", `"effort":"high","perTurnEffort":"medium",`) + req("c", `"effort":"high",`)
+	s := claudeSessionsService(t, map[string]string{id: body})
+	ctx := context.Background()
+	rows, err := s.Effort(ctx, EffortFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	levels := map[string]EffortRow{}
+	var total float64
+	for _, r := range rows {
+		levels[r.Level] = r
+		total += r.CostUSD
+	}
+	if len(rows) != 2 || levels["high"].Requests != 2 || levels["medium"].Requests != 1 || levels["high"].Agent != "claude-code" {
+		t.Fatalf("effort rows = %+v", rows)
+	}
+	d, err := s.Session(ctx, string(claude.Slug), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total <= 0 || math.Abs(total-d.CostUSD) > 1e-9 {
+		t.Errorf("effort cost %v does not add up to the session's %v", total, d.CostUSD)
+	}
+}
+
+// Resuming copies a session's history into the new file, so a turn exists
+// in every session of the chain; it is charged where it happened — the
+// session that ended first — whichever copy indexed first. Here the
+// resumed file sorts (and indexes) before its parent.
+func TestResumedTurnsAreChargedWhereTheyHappened(t *testing.T) {
+	const (
+		parent  = "ffffffff-0000-0000-0000-000000000001"
+		resumed = "00000000-0000-0000-0000-000000000002"
+	)
+	turn := func(session, n, ts string) string {
+		return `{"type":"assistant","sessionId":"` + session + `","timestamp":"` + ts + `","uuid":"u` + n + `","requestId":"req` + n + `",` +
+			`"message":{"id":"msg` + n + `","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"output_tokens":100}}}` + "\n"
+	}
+	files := map[string]string{
+		parent:  turn(parent, "1", "2026-10-01T10:00:00Z") + turn(parent, "2", "2026-10-01T10:01:00Z"),
+		resumed: turn(parent, "1", "2026-10-01T10:00:00Z") + turn(parent, "2", "2026-10-01T10:01:00Z") + turn(resumed, "3", "2026-10-02T09:00:00Z"),
+	}
+	s := claudeSessionsService(t, files)
+	ctx := context.Background()
+	inputs := map[string]int64{}
+	for _, id := range []string{parent, resumed} {
+		d, err := s.Session(ctx, string(claude.Slug), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inputs[id] = d.Tokens.Input
+	}
+	if inputs[parent] != 2000 || inputs[resumed] != 1000 {
+		t.Errorf("input tokens = %v, want the parent charged its 2 turns and the resumed session its 1", inputs)
 	}
 }

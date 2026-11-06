@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { test, expect } from "@playwright/test";
 
 // Regression cover for the UI/UX pass. Each test pins a defect that
@@ -93,6 +94,69 @@ test.describe("figures tell the truth", () => {
     const shown = parseUSD(header);
     expect(shown).toBeGreaterThanOrEqual(low - 0.005);
     expect(shown).toBeLessThanOrEqual(high + 0.005);
+  });
+});
+
+test.describe("cost provenance", () => {
+  // The Usage cost chart and the Insights effort chart are one component;
+  // both must behave the same.
+  for (const [name, url] of [
+    ["usage", "/usage"],
+    ["effort", "/insights?tab=effort"],
+  ]) {
+    test(`${name} chart drag-selects a range and only then offers reset`, async ({
+      page,
+    }) => {
+      await page.goto(url);
+      const chart = page.getByRole("img", { name: /drag across the plot/ });
+      await expect(chart).toBeVisible();
+      const reset = page.getByRole("button", { name: "Reset chart zoom" });
+      await expect(reset).toHaveCount(0);
+
+      const box = await chart.boundingBox();
+      expect(box).not.toBeNull();
+      if (!box) return;
+      const y = box.y + box.height / 2;
+      await page.mouse.move(box.x + 90, y);
+      await page.mouse.down();
+      await page.mouse.move(box.x + box.width - 90, y, { steps: 5 });
+      await page.mouse.up();
+
+      await expect(reset).toBeVisible();
+      const resetBox = await reset.boundingBox();
+      expect(resetBox).not.toBeNull();
+      if (resetBox) {
+        expect(resetBox.x).toBeGreaterThan(box.x + box.width - 40);
+        expect(resetBox.y).toBeLessThan(box.y + 36);
+      }
+      await reset.click();
+      await expect(reset).toHaveCount(0);
+    });
+  }
+
+  test("uses one automatic cost path", async ({ page }) => {
+    await page.goto("/usage");
+    await expect(
+      page.getByRole("radiogroup", { name: "Cost provenance" }),
+    ).toHaveCount(0);
+  });
+
+  test("timeline CSV names incomplete-cost columns explicitly", async ({
+    page,
+  }) => {
+    await page.goto("/usage");
+    const exportButton = page.getByRole("button", { name: "export CSV" });
+    await expect(exportButton).toBeVisible();
+    const [download] = await Promise.all([
+      page.waitForEvent("download"),
+      exportButton.click(),
+    ]);
+    const path = await download.path();
+    expect(path).not.toBeNull();
+    const csv = await readFile(path, "utf8");
+    const header = csv.slice(0, csv.indexOf("\n"));
+    expect(header).toContain("_has_incomplete_cost");
+    expect(header).not.toContain("_has_unpriced");
   });
 });
 

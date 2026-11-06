@@ -20,7 +20,8 @@ func parseFixture(t *testing.T) *agenttest.Sink {
 	if err != nil {
 		t.Fatal(err)
 	}
-	refs, err := New().Discover(context.Background(),
+	adapter := New()
+	refs, err := adapter.Discover(context.Background(),
 		agent.Root{Agent: Slug, Path: root, Origin: agent.RootFromDefault})
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
@@ -28,8 +29,11 @@ func parseFixture(t *testing.T) *agenttest.Sink {
 	if len(refs) != 1 {
 		t.Fatalf("discovered %d sources, want 1", len(refs))
 	}
+	if len(refs[0].CompanionPaths) != 1 || filepath.Base(refs[0].CompanionPaths[0]) != "session_index.jsonl" {
+		t.Fatalf("rollout companions = %v, want session_index.jsonl", refs[0].CompanionPaths)
+	}
 	sink := &agenttest.Sink{}
-	if err := New().Parse(context.Background(), refs[0], sink); err != nil {
+	if err := adapter.Parse(context.Background(), refs[0], sink); err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
 	return sink
@@ -49,8 +53,8 @@ func TestParseSessionMeta(t *testing.T) {
 	if sess.CWD != "/home/u/demo/api" || sess.GitBranch != "main" {
 		t.Errorf("cwd/branch = %q/%q", sess.CWD, sess.GitBranch)
 	}
-	if sess.Title != "Profile the login endpoint and find the slow path" {
-		t.Errorf("title = %q", sess.Title)
+	if sess.Title != "profile-login-performance" || !sess.TitleOverride {
+		t.Errorf("title = %q override=%v, want Codex thread name", sess.Title, sess.TitleOverride)
 	}
 }
 
@@ -150,7 +154,8 @@ func TestArgvRendersAsACommandLine(t *testing.T) {
 		{"plain argv joined", `{"command":["ls","-la"]}`, "ls -la"},
 		{"single element", `{"command":["pwd"]}`, "pwd"},
 		{"absent", `{}`, ""},
-		{"not an array", `{"command":"already a string"}`, ""},
+		{"shell_command string", `{"command":"already a string"}`, "already a string"},
+		{"exec_command cmd", `{"cmd":"go test ./..."}`, "go test ./..."},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := toolArgs(tt.argv).command(); got != tt.want {
@@ -161,10 +166,121 @@ func TestArgvRendersAsACommandLine(t *testing.T) {
 }
 
 func TestCounterResetTreatedAsAbsolute(t *testing.T) {
-	st := tokenState{total: &tokenUsage{InputTokens: 10000, TotalTokens: 12000}}
-	got := perTurnUsage(tokenCountInfo{Total: &tokenUsage{InputTokens: 500, TotalTokens: 600}}, &st)
-	if got.InputTokens != 500 {
+	st := tokenState{total: &tokenUsage{InputTokens: 10000, CacheWriteInputTokens: 2000, TotalTokens: 12000}}
+	got := perTurnUsage(tokenCountInfo{Total: &tokenUsage{InputTokens: 500, CacheWriteInputTokens: 100, TotalTokens: 600}}, &st)
+	if got.InputTokens != 500 || got.CacheWriteInputTokens != 100 {
 		t.Errorf("reset delta = %+v, want absolute values", got)
+	}
+}
+
+func TestCacheWritesAreSeparatedFromOrdinaryInput(t *testing.T) {
+	const meta = `{"timestamp":"2026-07-06T09:00:00.000Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"/home/u/demo/api"}}`
+	first := `{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":60,"output_tokens":10,"reasoning_output_tokens":5,"total_tokens":110}`
+	second := `{"input_tokens":180,"cached_input_tokens":70,"cache_write_input_tokens":100,"output_tokens":30,"reasoning_output_tokens":12,"total_tokens":210}`
+
+	src := writeRollout(
+		t, meta,
+		tokenCountLine("2026-07-06T09:00:10.000Z", first, "null"),
+		tokenCountLine("2026-07-06T09:00:20.000Z", second, "null"),
+	)
+	usages := sessionUsage(t, src)
+	if len(usages) != 2 {
+		t.Fatalf("usage entries = %d, want 2", len(usages))
+	}
+	if got := *usages[0]; got.InputTokens != 0 || got.CacheReadTokens != 40 || got.CacheWriteTokens != 60 || got.OutputTokens != 10 || got.ReasoningTokens != 5 {
+		t.Errorf("first usage = %+v", got)
+	}
+	// The cumulative delta is 80 input: 30 cache reads, 40 cache writes,
+	// and 10 ordinary input.
+	if got := *usages[1]; got.InputTokens != 10 || got.CacheReadTokens != 30 || got.CacheWriteTokens != 40 || got.OutputTokens != 20 || got.ReasoningTokens != 7 {
+		t.Errorf("second usage = %+v", got)
+	}
+}
+
+func TestCacheSubsetsCannotCreateNegativeInput(t *testing.T) {
+	const meta = `{"timestamp":"2026-07-06T09:00:00.000Z","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"/home/u/demo/api"}}`
+	usage := `{"input_tokens":100,"cached_input_tokens":80,"cache_write_input_tokens":30,"output_tokens":10,"total_tokens":110}`
+	src := writeRollout(t, meta, tokenCountLine("2026-07-06T09:00:10.000Z", usage, usage))
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	var got *canon.Usage
+	for _, message := range sink.Messages {
+		if message.Usage != nil {
+			got = message.Usage
+			break
+		}
+	}
+	if got == nil || got.InputTokens != 0 || got.CacheReadTokens != 80 || got.CacheWriteTokens != 30 {
+		t.Fatalf("clamped usage = %+v", got)
+	}
+	if len(sink.Issues) != 1 || sink.Issues[0].Category != "usage" || !strings.Contains(sink.Issues[0].Detail, "clamping ordinary input") {
+		t.Fatalf("issues = %+v, want visible subset warning", sink.Issues)
+	}
+}
+
+func TestSessionTitleSkipsInjectedContext(t *testing.T) {
+	src := writeRollout(
+		t,
+		`{"timestamp":"2026-07-06T09:00:00.000Z","type":"session_meta","payload":{"id":"`+sessionID+`","cwd":"/tmp/demo"}}`,
+		`{"timestamp":"2026-07-06T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>synthetic context</recommended_plugins>"}]}}`,
+		`{"timestamp":"2026-07-06T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"explain the failing build"}]}}`,
+	)
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.Sessions[len(sink.Sessions)-1]
+	if got.Title != "explain the failing build" || got.TitleOverride {
+		t.Fatalf("session title = %q override=%v, want first real prompt", got.Title, got.TitleOverride)
+	}
+}
+
+func TestCodexPromptTitleSkipsInjectedContext(t *testing.T) {
+	for _, text := range []string{
+		"<environment_context>metadata</environment_context>",
+		"<permissions instructions=\"ask\">metadata</permissions>",
+		"<recommended_plugins>metadata</recommended_plugins>",
+		"<user_instructions>metadata</user_instructions>",
+	} {
+		if got := codexPromptTitle(text); got != "" {
+			t.Errorf("codexPromptTitle(%q) = %q, want empty", text, got)
+		}
+	}
+	if got := codexPromptTitle("  explain the failing build  "); got != "explain the failing build" {
+		t.Errorf("real prompt title = %q", got)
+	}
+}
+
+func TestParseVersionIncludesLatestNormalization(t *testing.T) {
+	if got := New().ParseVersion(); got != 8 {
+		t.Fatalf("ParseVersion() = %d, want 8", got)
+	}
+}
+
+// Current Codex rollouts name the model only in session_meta's
+// base_instructions provenance; most carry no turn_context at all. Messages
+// with no model cannot be priced, so the session_meta model must reach
+// them — while a later turn_context still records a switch.
+func TestSessionMetaModelReachesMessages(t *testing.T) {
+	src := writeRollout(t,
+		`{"timestamp":"2026-07-06T09:00:00.000Z","type":"session_meta","payload":{"id":"`+sessionID+`","cwd":"/w","base_instructions":{"provenance":{"type":"model","model":"gpt-6-astra"}}}}`,
+		`{"timestamp":"2026-07-06T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}`,
+		`{"timestamp":"2026-07-06T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}`,
+		`{"timestamp":"2026-07-06T09:00:03.000Z","type":"turn_context","payload":{"model":"gpt-6-mini"}}`,
+		`{"timestamp":"2026-07-06T09:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"switched"}]}}`,
+	)
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	var models []string
+	for _, m := range sink.Messages {
+		models = append(models, m.Model)
+	}
+	if want := []string{"gpt-6-astra", "gpt-6-astra", "gpt-6-mini"}; strings.Join(models, ",") != strings.Join(want, ",") {
+		t.Errorf("message models = %v, want %v", models, want)
 	}
 }
 
@@ -270,4 +386,63 @@ func TestRepeatedLastTokenUsageCountsOnce(t *testing.T) {
 			t.Fatalf("usage entries = %d, want 3", len(usages))
 		}
 	})
+}
+
+// Codex records a turn's exact duration only in newer rollouts; older ones
+// carry Unix-second bounds, which still measure the turn.
+func TestTaskCompleteBecomesTurnEvent(t *testing.T) {
+	src := writeRollout(t,
+		`{"timestamp":"2026-07-06T09:00:00.000Z","type":"session_meta","payload":{"id":"`+sessionID+`","cwd":"/w"}}`,
+		`{"timestamp":"2026-07-06T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}`,
+		`{"timestamp":"2026-07-06T09:03:00.000Z","type":"event_msg","payload":{"type":"task_complete","started_at":1789218201,"completed_at":1789218387,"duration_ms":185592,"time_to_first_token_ms":2940}}`,
+		`{"timestamp":"2026-07-06T09:04:00.000Z","type":"event_msg","payload":{"type":"task_complete","started_at":1789218500,"completed_at":1789218503}}`,
+	)
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Events) != 2 || sink.Events[0].DurationMs != 185592 || sink.Events[1].DurationMs != 3000 ||
+		!strings.Contains(string(sink.Events[0].Payload), "2940") {
+		t.Errorf("turn events = %+v", sink.Events)
+	}
+}
+
+// Current Codex sends apply_patch and code mode as freeform custom tools,
+// and most tool outputs as arrays of content items; older Codex sent
+// apply_patch as a JSON function. The line shapes below come from real
+// rollouts (codex-rs ResponseItem / FunctionCallOutputPayload).
+func TestCustomToolsPatchesAndContentItemOutputs(t *testing.T) {
+	src := writeRollout(t,
+		`{"timestamp":"2026-07-06T09:00:00.000Z","type":"session_meta","payload":{"id":"`+sessionID+`","cwd":"/w"}}`,
+		`{"timestamp":"2026-07-06T09:00:01.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"p1","name":"apply_patch","input":"*** Begin Patch\n*** Add File: docs/gen.py\n+#!/usr/bin/env python3\n+print('hi')\n*** End Patch"}}`,
+		`{"timestamp":"2026-07-06T09:00:02.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"p1","output":[{"type":"input_text","text":"Success. Updated the following files:"},{"type":"input_text","text":"A docs/gen.py"}]}}`,
+		`{"timestamp":"2026-07-06T09:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: src/auth.ts\\n@@\\n-old\\n+new\\n*** End Patch\\n\"}","call_id":"p2"}}`,
+		`{"timestamp":"2026-07-06T09:00:04.000Z","type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"x1","name":"exec","input":"text(await tools.exec_command({cmd:\"jj status\"}))"}}`,
+		`{"timestamp":"2026-07-06T09:00:05.000Z","type":"response_item","payload":{"type":"function_call","name":"js","arguments":"{}","call_id":"f1"}}`,
+		`{"timestamp":"2026-07-06T09:00:06.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"f1","output":[{"type":"input_text","text":"done"}]}}`,
+	)
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.ToolCalls) != 4 {
+		t.Fatalf("tool calls = %d, want 4", len(sink.ToolCalls))
+	}
+	add, update, exec := sink.ToolCalls[0], sink.ToolCalls[1], sink.ToolCalls[2]
+	if add.Kind != canon.ToolFileEdit || add.FilePath != "docs/gen.py" || add.Lines == nil || add.Lines.Added != 2 {
+		t.Errorf("freeform apply_patch = %+v", add)
+	}
+	if update.FilePath != "src/auth.ts" || update.Lines == nil || update.Lines.Added != 1 || update.Lines.Removed != 1 {
+		t.Errorf("JSON apply_patch = %+v", update)
+	}
+	if exec.Kind != canon.ToolScript || !strings.Contains(exec.Command, "exec_command") {
+		t.Errorf("code mode exec = %+v", exec)
+	}
+	results := map[string]canon.ToolResult{}
+	for _, r := range sink.ToolResults {
+		results[r.CallExternalID] = r
+	}
+	if !strings.Contains(results["p1"].Excerpt, "A docs/gen.py") || results["f1"].Excerpt != "done" {
+		t.Errorf("content-item outputs = %+v", results)
+	}
 }

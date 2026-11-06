@@ -13,6 +13,7 @@ import {
   plural,
   shortPath,
   type ToolCallRow,
+  messageImageUrl,
   type TranscriptMessage,
 } from "../../api";
 import { fullWhen, localClock } from "../../time";
@@ -30,7 +31,7 @@ import {
   useSlashFocus,
   useToggleSet,
 } from "../../ui";
-import { ToolExpansion } from "./ToolExpansion";
+import { isCodeKind, ToolExpansion } from "./ToolExpansion";
 
 // Transcript lenses: the reader's filter over a session that can run to
 // thousands of entries.
@@ -54,6 +55,7 @@ export function Transcript({
   const {
     msgs,
     chipRows: tools,
+    chipsSettled,
     focusSeq,
     loading,
     error,
@@ -75,6 +77,9 @@ export function Transcript({
   // Meta entries (toolResult, system, …) render as one-line excerpts;
   // clicking reveals the full stored text.
   const [openMeta, toggleMeta] = useToggleSet<number>();
+  // Thinking starts folded: it is usually longer than the reply it led to.
+  // Held at the list level for the same reason as the two sets beside it.
+  const [openThinking, toggleThinking] = useToggleSet<number>();
   // Which tool chips are expanded, keyed by call seq. This lives at the
   // LIST level, not inside the row: rows are virtualized, so state held in
   // one unmounts the moment the reader scrolls it off screen — an opened
@@ -104,6 +109,8 @@ export function Transcript({
       msgs.filter(
         (m) =>
           m.text.trim() !== "" ||
+          Boolean(m.thinking) ||
+          (m.images?.length ?? 0) > 0 ||
           (toolsByMsg.get(m.seq)?.length ?? 0) > 0 ||
           m.seq === focusSeq,
       ),
@@ -181,20 +188,38 @@ export function Transcript({
   useEffect(() => {
     setFocusDone(focusSeq === undefined);
   }, [focusSeq]);
-  useEffect(() => {
-    if (focusSeq === undefined || focusDone) return;
+  useLayoutEffect(() => {
+    // Wait for the range's tool chips: they arrive after the messages and
+    // grow every row they land in, so an anchor taken before them was
+    // pushed off screen by thousands of pixels of chips above it.
+    if (focusSeq === undefined || focusDone || !chipsSettled) return;
     const idx = visible.findIndex((m) => m.seq === focusSeq);
     if (idx < 0) return;
-    // Programmatic: the scroll this fires must not be read back as the
-    // reader moving, or the spy below immediately rewrites ?seq to whatever
-    // ends up at the top of the viewport — destroying the very permalink
-    // that was just opened.
     quietSpy();
-    virtualizer.scrollToIndex(idx, { align: "center" });
-    setFocusDone(true);
-    // quietSpy only touches a ref.
+    const row = document.getElementById(`seq-${focusSeq}`);
+    if (row) {
+      // Align the mounted row before paint, then release the gate in the
+      // same layout commit. A delayed retry loop can steal the reader's
+      // first scroll after the target appears.
+      row.scrollIntoView({ block: "center", behavior: "instant" });
+      setFocusDone(true);
+    } else {
+      // Estimated scrolling only mounts the target. The next mounted
+      // window completes positioning against its actual DOM geometry.
+      virtualizer.scrollToIndex(idx, { align: "center" });
+    }
+    // quietSpy only touches a ref; window edges identify newly mounted rows.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusSeq, focusDone, visible, virtualizer]);
+  }, [
+    focusSeq,
+    focusDone,
+    chipsSettled,
+    visible,
+    virtualizer,
+    virtualItems[0]?.key,
+    virtualItems[virtualItems.length - 1]?.key,
+    virtualizer.options.scrollMargin,
+  ]);
 
   // Prepending older messages grows the document above the viewport, which
   // would jump the reader downward. Capture the height just before an older
@@ -225,11 +250,15 @@ export function Transcript({
   useEffect(() => {
     if (!hasOlder || loadingOlder || !focusDone || rangeStart === undefined)
       return;
-    if (rangeStart <= 4) {
+    // The virtual range can lag a programmatic scroll by a frame. Check
+    // the real list position too, or releasing the focus gate can prepend
+    // old pages while the reader is already at the middle-of-session target.
+    const top = listRef.current?.getBoundingClientRect().top;
+    if (rangeStart <= 4 && top !== undefined && top >= -window.innerHeight) {
       beforeOlder.current = document.documentElement.scrollHeight;
       onLoadOlder();
     }
-  }, [hasOlder, loadingOlder, focusDone, rangeStart, onLoadOlder]);
+  }, [hasOlder, loadingOlder, focusDone, rangeStart, onLoadOlder, listRef]);
 
   // Scroll-spy: keep the URL pointed at the topmost message in view so the
   // address bar is always a shareable link to the reader's spot. During a
@@ -474,6 +503,13 @@ export function Transcript({
                       {m.text}
                     </pre>
                   )}
+                  {m.thinking && (
+                    <Thinking
+                      text={m.thinking}
+                      open={openThinking.has(m.seq)}
+                      onToggle={() => toggleThinking(m.seq)}
+                    />
+                  )}
                   {!isMeta &&
                     m.text.trim() !== "" &&
                     (m.html ? (
@@ -486,6 +522,9 @@ export function Transcript({
                         {m.text}
                       </div>
                     ))}
+                  {(m.images?.length ?? 0) > 0 && (
+                    <MessageImages agent={agent} sessionId={sessionId} m={m} />
+                  )}
                   {msgTools.length > 0 && (
                     <MessageTools
                       agent={agent}
@@ -534,6 +573,81 @@ export function Transcript({
     </div>
   );
 }
+// Thinking is the model's reasoning, folded to one dim line until opened.
+function Thinking({
+  text,
+  open,
+  onToggle,
+}: {
+  text: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full min-w-0 items-baseline gap-2 text-left font-mono text-meta text-ink-faint hover:text-ink-dim"
+      >
+        <span className="shrink-0 text-assistant/70">
+          {open ? "▾" : "▸"} thinking
+        </span>
+        {!open && (
+          <span className="min-w-0 truncate italic">{text.split("\n")[0]}</span>
+        )}
+      </button>
+      {open && (
+        <div className="measure mt-1 border-l-2 border-assistant/30 pl-3 text-sm leading-relaxed whitespace-pre-wrap text-ink-dim italic">
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// MessageImages shows an entry's images (pasted screenshots, tool
+// screenshots) as thumbnails that open full size in a new tab. No
+// loading="lazy": the virtualizer already mounts only the rows on screen,
+// and native lazy loading never fired inside its transformed rows. The
+// fixed thumbnail height keeps the row's height known before the bytes
+// arrive: a row that grows on load pushed a ?seq= deep link's target off
+// screen after the anchor had already scrolled to it.
+function MessageImages({
+  agent,
+  sessionId,
+  m,
+}: {
+  agent: string;
+  sessionId: string;
+  m: TranscriptMessage;
+}) {
+  return (
+    <div className="mt-2 flex flex-wrap gap-2">
+      {m.images?.map((img) => {
+        const src = messageImageUrl(agent, sessionId, m.seq, img.index);
+        return (
+          <a
+            key={img.index}
+            href={src}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open image ${img.index + 1} (${img.mediaType})`}
+            className="block overflow-hidden rounded border border-edge hover:border-edge-strong"
+          >
+            <img
+              src={src}
+              alt={`Image ${img.index + 1} of message #${m.seq}`}
+              className="block h-48 w-auto max-w-xs object-contain"
+            />
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
 // MessageTools renders a message's tool calls as kind-colored chips;
 // expandable chips fetch their full payload (diff excerpts, complete
 // command) only when opened — chip rows never carry them.
@@ -562,11 +676,12 @@ function MessageTools({
         {tools.map((t) => {
           // Expand only when there is more than the chip already shows: a
           // diff (edits and writes carry payloads behind the detail
-          // lookup), a full shell command, or a truncated detail.
+          // lookup), a full shell command or script, or a truncated detail.
+          const isCode = isCodeKind(t.kind);
           const expandable =
             t.kind === "file_edit" ||
             t.kind === "file_write" ||
-            (t.kind === "shell" && Boolean(t.detail)) ||
+            (isCode && Boolean(t.detail)) ||
             Boolean(t.detail && t.detail.length > 80);
           const isOpen = open.has(t.seq);
           return (
@@ -589,7 +704,7 @@ function MessageTools({
               <span style={{ color: toolColor(t.kind) }}>{t.name}</span>
               {t.detail && (
                 <span className="truncate text-ink-dim">
-                  {t.kind === "shell"
+                  {isCode
                     ? t.detail.split("\n")[0].slice(0, 80)
                     : shortPath(t.detail)}
                 </span>
@@ -607,7 +722,7 @@ function MessageTools({
           <div key={t.seq} className="mt-2">
             <div className="mb-1 font-mono text-micro text-ink-faint">
               <span style={{ color: toolColor(t.kind) }}>{t.name}</span>
-              {t.detail && t.kind !== "shell" && <> · {shortPath(t.detail)}</>}
+              {t.detail && !isCodeKind(t.kind) && <> · {shortPath(t.detail)}</>}
             </div>
             <ToolExpansion agent={agent} sessionId={sessionId} seq={t.seq} />
           </div>

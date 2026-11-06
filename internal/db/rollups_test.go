@@ -18,6 +18,13 @@ func (p stubPricer) Lookup(model string) (pricing.Rate, bool) {
 	return r, ok
 }
 
+type versionedPricer struct {
+	stubPricer
+	version string
+}
+
+func (p versionedPricer) Fingerprint() string { return p.version }
+
 // usageMessage writes one assistant message carrying usage into an
 // existing session.
 func usageMessage(t *testing.T, w *Writer, sessionID int64, agent canon.AgentSlug, seq int, model string, at time.Time, u canon.Usage) {
@@ -78,6 +85,140 @@ func TestRegenerateRollupsBlankModelIsUnpriced(t *testing.T) {
 	}
 	if in != 100 {
 		t.Errorf("input_tokens = %d, want 100 — tokens must still be counted", in)
+	}
+}
+
+func TestReportedZeroWithTokensFallsBackToEstimate(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	w := beginWrite(t, s)
+	id, err := w.UpsertSession(testSession("zero-report"), "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := 0.0
+	usageMessage(t, w, id, "opencode", 0, "model-a",
+		time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC), canon.Usage{
+			InputTokens: 10, ReportedCostUSD: &zero,
+		})
+	// Unknown zero-token rows must not make the group falsely unpriced.
+	usageMessage(t, w, id, "claude-code", 1, "<synthetic>",
+		time.Date(2026, 7, 1, 10, 1, 0, 0, time.UTC), canon.Usage{})
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	p := stubPricer{"model-a": {Input: 2}}
+	if err := s.RegenerateRollups(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	var cost, reported, estimated float64
+	var priced int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT SUM(cost_usd), SUM(cost_reported_usd),
+		       SUM(cost_estimated_usd), MIN(priced)
+		FROM rollup_usage_daily`).Scan(&cost, &reported, &estimated, &priced); err != nil {
+		t.Fatal(err)
+	}
+	if cost != 20 || reported != 0 || estimated != 20 || priced != 1 {
+		t.Errorf("cost/report/estimate/priced = %v/%v/%v/%d, want 20/0/20/1",
+			cost, reported, estimated, priced)
+	}
+}
+
+func TestRollupsMaterializeExactAutomaticCostWithHistoricalTiers(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	w := beginWrite(t, s)
+	id, err := w.UpsertSession(testSession("exact-automatic-cost"), "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reported := 7.0
+	at := time.Date(2025, 6, 1, 10, 0, 0, 0, time.UTC)
+	usageMessage(t, w, id, "claude-code", 0, "tiered", at, canon.Usage{InputTokens: 201, ReportedCostUSD: &reported})
+	usageMessage(t, w, id, "claude-code", 1, "tiered", at.Add(time.Minute), canon.Usage{InputTokens: 1})
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	table, err := pricing.Parse([]byte(`{
+		"source":"test","fetched_at":"2026-01-01T00:00:00Z",
+		"models":{"tiered":{"input":9,"output":9}},
+		"history":{"tiered":[{"effective_from":"2025-01-01","effective_to":"2026-01-01","rate":{
+			"input":3,"output":1,"tiers":[{"above_input_tokens":200,"input":4}]
+		}}]}}
+	`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegenerateRollups(ctx, table); err != nil {
+		t.Fatal(err)
+	}
+	var cost, reportedNanos, estimated int64
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT cost_nanos, cost_reported_nanos, cost_estimated_nanos
+		FROM rollup_usage_daily`).Scan(&cost, &reportedNanos, &estimated); err != nil {
+		t.Fatal(err)
+	}
+	// Automatic cost = reported $7 + the second row's historical $3 estimate.
+	if cost != 10_000_000_000 || reportedNanos != 7_000_000_000 || estimated != 3_000_000_000 {
+		t.Errorf("cost/reported/estimated = %d/%d/%d", cost, reportedNanos, estimated)
+	}
+}
+
+func TestRollupsWithNoUsageAreStale(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO agents (id, slug) VALUES (1, 'claude-code')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO rollup_usage_daily (day, agent_id) VALUES ('2026-01-01', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := s.RollupsNeedRegeneration(ctx, stubPricer{})
+	if err != nil || !dirty {
+		t.Fatalf("stale rollup without usage dirty=%v err=%v, want true", dirty, err)
+	}
+	if err := s.RegenerateRollups(ctx, stubPricer{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM rollup_usage_daily`); n != 0 {
+		t.Fatalf("rollups after regeneration = %d, want 0", n)
+	}
+}
+
+func TestPricingFingerprintInvalidatesUnchangedRollups(t *testing.T) {
+	ctx := context.Background()
+	s, _ := openTemp(t)
+	w := beginWrite(t, s)
+	id, err := w.UpsertSession(testSession("fingerprint"), "hash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usageMessage(t, w, id, "claude-code", 0, "model-a",
+		time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC), canon.Usage{InputTokens: 10})
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	v1 := versionedPricer{stubPricer: stubPricer{"model-a": {Input: 1}}, version: "v1"}
+	if err := s.RegenerateRollups(ctx, v1); err != nil {
+		t.Fatal(err)
+	}
+	if dirty, err := s.RollupsNeedRegeneration(ctx, v1); err != nil || dirty {
+		t.Fatalf("same fingerprint dirty=%v err=%v", dirty, err)
+	}
+	v2 := versionedPricer{stubPricer: stubPricer{"model-a": {Input: 2}}, version: "v2"}
+	if dirty, err := s.RollupsNeedRegeneration(ctx, v2); err != nil || !dirty {
+		t.Fatalf("changed fingerprint dirty=%v err=%v", dirty, err)
+	}
+	if err := s.RegenerateRollups(ctx, v2); err != nil {
+		t.Fatal(err)
+	}
+	var cost float64
+	if err := s.db.QueryRowContext(ctx, `SELECT cost_usd FROM rollup_usage_daily`).Scan(&cost); err != nil {
+		t.Fatal(err)
+	}
+	if cost != 20 {
+		t.Errorf("repriced cost = %v, want 20", cost)
 	}
 }
 

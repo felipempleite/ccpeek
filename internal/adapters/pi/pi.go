@@ -4,7 +4,7 @@
 // line is a session header and whose entries form a tree via id/parentId,
 // enabling in-place branching. Assistant entries carry token usage AND a
 // pre-computed cost breakdown — the first consumer of the cost engine's
-// reported-vs-calculated mode (docs/v2-plan.md §6).
+// automatic reported-first selection (docs/v2-plan.md §6).
 package pi
 
 import (
@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,13 @@ func New() *Adapter { return &Adapter{} }
 
 // Slug implements agent.Adapter.
 func (*Adapter) Slug() canon.AgentSlug { return Slug }
+
+// ParseVersion forces one full reparse after per-message provider/model,
+// summary-entry usage, fallback-title normalization, codemode scripts with
+// their nested calls, thinking text with image locators, error/abort
+// events, tool timing, compaction events, file change line counts,
+// per-turn thinking level, and multi-edit diffs became canonical.
+func (*Adapter) ParseVersion() int { return 11 }
 
 // RootSpec implements agent.Adapter: Pi relocates its data dir via
 // PI_CODING_AGENT_DIR.
@@ -104,11 +112,15 @@ type entry struct {
 	Provider string `json:"provider"`
 	ModelID  string `json:"modelId"`
 
+	// type == "thinking_level_change"
+	ThinkingLevel string `json:"thinkingLevel"`
+
 	// type == "compaction" | "branch_summary"
-	Summary          string `json:"summary"`
-	FirstKeptEntryID string `json:"firstKeptEntryId"`
-	TokensBefore     int64  `json:"tokensBefore"`
-	FromID           string `json:"fromId"`
+	Summary          string   `json:"summary"`
+	FirstKeptEntryID string   `json:"firstKeptEntryId"`
+	TokensBefore     int64    `json:"tokensBefore"`
+	FromID           string   `json:"fromId"`
+	Usage            *piUsage `json:"usage"`
 
 	// type == "label"
 	TargetID string `json:"targetId"`
@@ -123,15 +135,46 @@ type entry struct {
 }
 
 type piMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
-	Usage   *piUsage        `json:"usage"`
+	Role     string          `json:"role"`
+	Content  json.RawMessage `json:"content"`
+	Provider string          `json:"provider"`
+	Model    string          `json:"model"`
+	Usage    *piUsage        `json:"usage"`
 
 	// role == "toolResult": the outcome of an earlier toolCall block,
 	// delivered as its own message entry.
-	ToolCallID string `json:"toolCallId"`
-	ToolName   string `json:"toolName"`
-	IsError    bool   `json:"isError"`
+	// role == "assistant": the thinking level the turn ran at (newer Pi;
+	// older sessions only record level changes as entries).
+	ThinkingLevel string `json:"thinkingLevel"`
+
+	// role == "assistant": why the turn ended; "error" and "aborted" carry
+	// errorMessage.
+	StopReason   string `json:"stopReason"`
+	ErrorMessage string `json:"errorMessage"`
+
+	ToolCallID  string         `json:"toolCallId"`
+	ToolName    string         `json:"toolName"`
+	IsError     bool           `json:"isError"`
+	NestedCalls *piNestedCalls `json:"nestedCalls"`
+	// Tool-specific; only an edit's patch is read (see editLines).
+	Details piDetails `json:"details"`
+}
+
+// piNestedCalls is Pi's bounded record of the tools a tool ran itself
+// (codemode's tools.read, tools.edit, …). Pi keeps no transcript entries
+// for them, so this is the only trace of what a script did. Results are
+// never recorded; arguments may be omitted when they are too large.
+type piNestedCalls struct {
+	Calls []piNestedCall `json:"calls"`
+}
+
+type piNestedCall struct {
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
+	Arguments  json.RawMessage `json:"arguments"`
+	Error      string          `json:"error"`
+	DurationMs float64         `json:"durationMs"`
 }
 
 type piUsage struct {
@@ -147,9 +190,29 @@ type piCost struct {
 	Total float64 `json:"total"`
 }
 
+func canonicalUsage(u *piUsage) *canon.Usage {
+	if u == nil {
+		return nil
+	}
+	out := &canon.Usage{
+		InputTokens: u.Input, OutputTokens: u.Output,
+		CacheReadTokens: u.CacheRead, CacheWriteTokens: u.CacheWrite,
+	}
+	if u.Cost != nil {
+		total := u.Cost.Total
+		out.ReportedCostUSD = &total
+	}
+	return out
+}
+
 type piBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
+
+	// type == "thinking" | "image". An image's base64 data is deliberately
+	// not decoded: it stays in the stored content, located by pointer.
+	Thinking string `json:"thinking"`
+	MimeType string `json:"mimeType"`
 
 	// type == "toolCall" (assistant content blocks).
 	ID        string          `json:"id"`
@@ -175,6 +238,8 @@ func normalizeTool(name string) canon.ToolKind {
 		return canon.ToolDiscovery
 	case "web_search", "web_fetch", "fetch":
 		return canon.ToolWeb
+	case "codemode":
+		return canon.ToolScript
 	default:
 		return canon.ToolOther
 	}
@@ -204,12 +269,63 @@ type piToolArgs struct {
 	OldText string `json:"oldText"`
 	NewText string `json:"newText"`
 	Content string `json:"content"` // write
+	Code    string `json:"code"`    // codemode
+	// edit: current Pi sends every replacement in one call; the top-level
+	// oldText/newText above are the older single-edit shape.
+	Edits []struct {
+		OldText string `json:"oldText"`
+		NewText string `json:"newText"`
+	} `json:"edits"`
 }
 
-func toolArgs(arguments json.RawMessage) piToolArgs {
+// editSeparator joins a multi-edit call's replacements into one old and
+// one new text. It is identical on both sides, so the line diff keeps it
+// as an unchanged line marking where one replacement ends.
+const editSeparator = "\n⋯\n"
+
+// editTexts is the call's replaced and replacement text, from either
+// edit shape.
+func (a piToolArgs) editTexts() (string, string) {
+	if len(a.Edits) == 0 {
+		return a.OldText, a.NewText
+	}
+	olds := make([]string, len(a.Edits))
+	news := make([]string, len(a.Edits))
+	for i, e := range a.Edits {
+		olds[i], news[i] = e.OldText, e.NewText
+	}
+	return strings.Join(olds, editSeparator), strings.Join(news, editSeparator)
+}
+
+// toolCall builds the canonical record for one Pi tool invocation, either
+// a model-issued toolCall block or a nested call a tool made itself.
+func toolCall(sessionID string, messageSeq, seq int, id, name string,
+	arguments json.RawMessage, at time.Time,
+) canon.ToolCall {
 	var a piToolArgs
 	_ = json.Unmarshal(arguments, &a)
-	return a
+	oldText, newText := a.editTexts()
+	var lines *canon.LineCounts
+	if name == "write" {
+		// Pi's write result carries no diff; the content is the new file.
+		// An overwrite's removed lines are not recorded anywhere.
+		lines = &canon.LineCounts{Added: canon.CountTextLines(a.Content)}
+	}
+	return canon.ToolCall{
+		Lines:             lines,
+		SessionExternalID: sessionID,
+		MessageSeq:        messageSeq,
+		Seq:               seq,
+		ExternalID:        id,
+		Name:              name,
+		Kind:              normalizeTool(name),
+		Input:             arguments,
+		FilePath:          a.Path,
+		Command:           cmp.Or(a.Command, a.Code),
+		OldText:           oldText,
+		NewText:           cmp.Or(newText, a.Content),
+		StartedAt:         at,
+	}
 }
 
 // Parse reads one Pi session file: header first, then tree entries.
@@ -229,11 +345,13 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 	// the first emit. Tool results pair through sink.ToolResult by call
 	// id instead of an in-memory index.
 	var (
-		sess         canon.Session
-		haveHeader   bool
-		messageCount int
-		toolCount    int
-		currentModel string
+		sess            canon.Session
+		haveHeader      bool
+		messageCount    int
+		toolCount       int
+		currentProvider string
+		currentModel    string
+		currentThinking string
 	)
 
 	scanErr := jsonl.Scan(f, maxLineBytes, func(lineNo int, line []byte) error {
@@ -284,9 +402,17 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 			sess.ModifiedAt = e.Timestamp
 		}
 
-		msg, dec, ok := a.convertEntry(e, messageCount, &sess, &currentModel)
+		if e.Type == "thinking_level_change" {
+			currentThinking = e.ThinkingLevel
+			return nil
+		}
+		msg, dec, ok := a.convertEntry(e, messageCount, &sess,
+			&currentProvider, &currentModel)
 		if !ok {
 			return nil
+		}
+		if msg.Role == canon.RoleAssistant && msg.Kind == canon.KindMessage {
+			msg.Effort = cmp.Or(dec.pm.ThinkingLevel, currentThinking)
 		}
 		msg.SessionExternalID = sess.ExternalID
 
@@ -305,40 +431,67 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 					CallExternalID:    dec.pm.ToolCallID,
 					Status:            status,
 					Excerpt:           canon.TruncateBytes(strings.TrimSpace(msg.Text), canon.ToolResultExcerptLimit),
+					At:                e.Timestamp,
+					Lines:             editLines(dec.pm),
 				}); err != nil {
 					return err
+				}
+				// Nested calls anchor to the result message that records
+				// them, so the transcript shows what a script did right
+				// under its output.
+				if dec.pm.NestedCalls != nil {
+					for _, nc := range dec.pm.NestedCalls.Calls {
+						tc := toolCall(sess.ExternalID, msg.Seq, toolCount,
+							nc.ID, nc.Name, nc.Arguments, e.Timestamp)
+						tc.ResultStatus = nc.Status
+						tc.ResultExcerpt = canon.TruncateBytes(strings.TrimSpace(nc.Error), canon.ToolResultExcerptLimit)
+						tc.DurationMs = int64(math.Round(nc.DurationMs))
+						if err := sink.ToolCall(tc); err != nil {
+							return err
+						}
+						toolCount++
+					}
 				}
 			default:
 				for _, b := range dec.blocks {
 					if b.Type != "toolCall" {
 						continue
 					}
-					args := toolArgs(b.Arguments)
-					if err := sink.ToolCall(canon.ToolCall{
-						SessionExternalID: sess.ExternalID,
-						MessageSeq:        msg.Seq,
-						Seq:               toolCount,
-						ExternalID:        b.ID,
-						Name:              b.Name,
-						Kind:              normalizeTool(b.Name),
-						Input:             b.Arguments,
-						FilePath:          args.Path,
-						Command:           args.Command,
-						OldText:           args.OldText,
-						NewText:           cmp.Or(args.NewText, args.Content),
-						StartedAt:         e.Timestamp,
-					}); err != nil {
+					if err := sink.ToolCall(toolCall(sess.ExternalID, msg.Seq, toolCount,
+						b.ID, b.Name, b.Arguments, e.Timestamp)); err != nil {
 						return err
 					}
 					toolCount++
 				}
 			}
 		}
-		if sess.Title == "" && msg.Role == canon.RoleUser && msg.Text != "" {
-			sess.Title = canon.TruncateBytes(strings.TrimSpace(msg.Text), canon.SessionTitleLimit)
+		if sess.Title == "" && msg.Role == canon.RoleUser {
+			if title := piPromptTitle(msg.Text); title != "" {
+				sess.Title = canon.TruncateBytes(title, canon.SessionTitleLimit)
+			}
 		}
 		if err := sink.Message(msg); err != nil {
 			return err
+		}
+		if e.Type == "compaction" {
+			payload, _ := json.Marshal(map[string]int64{"preTokens": e.TokensBefore})
+			if err := sink.SessionEvent(canon.SessionEvent{
+				SessionExternalID: sess.ExternalID,
+				MessageSeq:        msg.Seq,
+				Kind:              canon.EventCompaction,
+				At:                e.Timestamp,
+				Detail:            canon.CompactionDetail(e.TokensBefore, 0),
+				Payload:           payload,
+			}); err != nil {
+				return err
+			}
+		}
+		if dec.ok {
+			if ev, ok := stopEvent(dec.pm, msg); ok {
+				if err := sink.SessionEvent(ev); err != nil {
+					return err
+				}
+			}
 		}
 		messageCount++
 		return nil
@@ -360,6 +513,84 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 	return sink.Session(sess)
 }
 
+// editLines sizes an edit from its result's unified patch.
+func editLines(pm piMessage) *canon.LineCounts {
+	if pm.ToolName != "edit" || pm.Details.patch == "" {
+		return nil
+	}
+	c := canon.CountDiffLines(strings.Split(pm.Details.patch, "\n"))
+	return &c
+}
+
+// piDetails keeps the one details field ccpeek reads. Other tools put
+// arbitrary shapes there, which must not fail the whole line.
+type piDetails struct{ patch string }
+
+func (d *piDetails) UnmarshalJSON(raw []byte) error {
+	var v struct {
+		Patch string `json:"patch"`
+	}
+	if json.Unmarshal(raw, &v) == nil {
+		d.patch = v.Patch
+	}
+	return nil
+}
+
+// stopEvent turns an assistant turn that ended in error or was aborted
+// into a session event.
+func stopEvent(pm piMessage, msg canon.Message) (canon.SessionEvent, bool) {
+	ev := canon.SessionEvent{
+		SessionExternalID: msg.SessionExternalID,
+		MessageSeq:        msg.Seq,
+		At:                msg.CreatedAt,
+		Detail:            strings.TrimSpace(pm.ErrorMessage),
+	}
+	switch pm.StopReason {
+	case "error":
+		ev.Kind = canon.EventAPIError
+		ev.Label = errorClass(pm.ErrorMessage)
+	case "aborted":
+		ev.Kind = canon.EventAborted
+		ev.Label = "user"
+	default:
+		return canon.SessionEvent{}, false
+	}
+	return ev, true
+}
+
+// errorClass maps Pi's free-text provider errors onto the classes Claude
+// Code records natively, so errors group the same way across agents.
+func errorClass(message string) string {
+	m := strings.ToLower(message)
+	switch {
+	case strings.Contains(m, "rate limit"), strings.Contains(m, "usage limit"), strings.Contains(m, "quota"):
+		return "rate_limit"
+	case strings.Contains(m, "context window"), strings.Contains(m, "context_length"):
+		return "invalid_request"
+	case strings.Contains(m, "oauth"), strings.Contains(m, "unauthorized"), strings.Contains(m, "api key"),
+		strings.Contains(m, "authentication"):
+		return "authentication_failed"
+	case strings.Contains(m, "socket"), strings.Contains(m, "connection"), strings.Contains(m, "fetch failed"),
+		strings.Contains(m, "unable to connect"), strings.Contains(m, "timed out"):
+		return "connection"
+	case strings.Contains(m, "overloaded"), strings.Contains(m, "server error"),
+		strings.Contains(m, "internal error"), strings.Contains(m, "service unavailable"):
+		return "server_error"
+	default:
+		return "error"
+	}
+}
+
+// piPromptTitle rejects skill envelopes injected as synthetic user messages.
+// They remain transcript provenance but do not describe the session's purpose.
+func piPromptTitle(text string) string {
+	title := strings.TrimSpace(text)
+	if strings.HasPrefix(title, "<skill ") {
+		return ""
+	}
+	return title
+}
+
 // decodedMessage is a "message" entry's payload decoded ONCE. The caller
 // needs the same piMessage and the same content blocks convertEntry has
 // already read, to emit tool calls and results; unmarshalling them again
@@ -375,12 +606,13 @@ type decodedMessage struct {
 // established by model_change entries; the walk is file order, which
 // matches the main path for non-branching sessions and is a documented
 // approximation for branched ones.
-func (a *Adapter) convertEntry(e entry, seq int, sess *canon.Session, currentModel *string) (canon.Message, decodedMessage, bool) {
+func (a *Adapter) convertEntry(e entry, seq int, sess *canon.Session, currentProvider, currentModel *string) (canon.Message, decodedMessage, bool) {
 	base := canon.Message{
 		Seq:              seq,
 		ExternalID:       e.ID,
 		ParentExternalID: e.ParentID,
 		CreatedAt:        e.Timestamp,
+		Provider:         *currentProvider,
 		Model:            *currentModel,
 	}
 
@@ -391,39 +623,39 @@ func (a *Adapter) convertEntry(e entry, seq int, sess *canon.Session, currentMod
 			return canon.Message{}, decodedMessage{}, false
 		}
 		dec := decodedMessage{pm: pm, blocks: piBlocks(pm.Content), ok: true}
+		if pm.Provider != "" {
+			base.Provider = pm.Provider
+			*currentProvider = pm.Provider
+		}
+		if pm.Model != "" {
+			// A model-only change cannot safely inherit the old provider: the
+			// pair may resolve to a provider-specific price for a backend Pi no
+			// longer uses. Keep the provider only when the model is unchanged.
+			if pm.Provider == "" && pm.Model != *currentModel {
+				base.Provider = ""
+				*currentProvider = ""
+			}
+			base.Model = pm.Model
+			*currentModel = pm.Model
+		}
 		base.Kind = canon.KindMessage
 		base.Role = normalizeRole(pm.Role)
 		base.Content = e.Message
 		base.Text = piText(pm.Content, dec.blocks)
+		base.Thinking, base.Images = piThinkingAndImages(dec.blocks)
 		if pm.Usage != nil {
-			// No RequestID, and no ContentID either: Pi's format carries
-			// neither, so these rows bypass the store's (content_id,
-			// request_id) usage dedupe. That is SAFE here and the reason is
-			// structural, not luck — Pi branches in place, so a branch is
-			// new entries with new ids in the SAME file, and a fork is a new
-			// session file that references its parent by header
-			// parentSession WITHOUT copying the parent's entries. Nothing
-			// replicates a usage-bearing entry, so nothing can double-count
-			// it. A future Pi that starts replaying parent entries into a
-			// fork would need a dedupe key invented here first.
-			usage := &canon.Usage{
-				InputTokens:      pm.Usage.Input,
-				OutputTokens:     pm.Usage.Output,
-				CacheReadTokens:  pm.Usage.CacheRead,
-				CacheWriteTokens: pm.Usage.CacheWrite,
-			}
-			if pm.Usage.Cost != nil {
-				total := pm.Usage.Cost.Total
-				usage.ReportedCostUSD = &total
-			}
-			base.Usage = usage
+			// Pi branches in place and forks reference their parent without
+			// copying entries, so its lack of a request-id dedupe key is safe.
+			base.Usage = canonicalUsage(pm.Usage)
 		}
 		return base, dec, true
 
 	case "model_change":
+		*currentProvider = e.Provider
 		*currentModel = e.ModelID
 		base.Kind = canon.KindModelChange
 		base.Role = canon.RoleSystem
+		base.Provider = e.Provider
 		base.Model = e.ModelID
 		base.Text = fmt.Sprintf("model changed to %s/%s", e.Provider, e.ModelID)
 		base.Content = mustJSON(map[string]string{"provider": e.Provider, "modelId": e.ModelID})
@@ -433,6 +665,7 @@ func (a *Adapter) convertEntry(e entry, seq int, sess *canon.Session, currentMod
 		base.Kind = canon.KindCompaction
 		base.Role = canon.RoleSystem
 		base.Text = e.Summary
+		base.Usage = canonicalUsage(e.Usage)
 		base.Content = mustJSON(map[string]any{
 			"summary": e.Summary, "firstKeptEntryId": e.FirstKeptEntryID,
 			"tokensBefore": e.TokensBefore,
@@ -443,6 +676,7 @@ func (a *Adapter) convertEntry(e entry, seq int, sess *canon.Session, currentMod
 		base.Kind = canon.KindBranchPoint
 		base.Role = canon.RoleSystem
 		base.Text = e.Summary
+		base.Usage = canonicalUsage(e.Usage)
 		base.Content = mustJSON(map[string]string{"summary": e.Summary, "fromId": e.FromID})
 		return base, decodedMessage{}, true
 
@@ -454,7 +688,10 @@ func (a *Adapter) convertEntry(e entry, seq int, sess *canon.Session, currentMod
 		return base, decodedMessage{}, true
 
 	case "session_info":
-		sess.Title = canon.TruncateBytes(e.Name, canon.SessionTitleLimit)
+		if name := strings.TrimSpace(e.Name); name != "" {
+			sess.Title = canon.TruncateBytes(name, canon.SessionTitleLimit)
+			sess.TitleOverride = true
+		}
 		return canon.Message{}, decodedMessage{}, false
 
 	case "custom_message":
@@ -483,6 +720,26 @@ func piBlocks(content json.RawMessage) []piBlock {
 		return nil
 	}
 	return arr
+}
+
+// piThinkingAndImages lifts reasoning text and image locators out of the
+// decoded blocks. Pointers are relative to the message payload stored as
+// Content.
+func piThinkingAndImages(decoded []piBlock) (string, []canon.ImageRef) {
+	var thinking []string
+	var images []canon.ImageRef
+	for i, b := range decoded {
+		switch b.Type {
+		case "thinking":
+			thinking = append(thinking, b.Thinking)
+		case "image":
+			images = append(images, canon.ImageRef{
+				MediaType: b.MimeType,
+				Pointer:   fmt.Sprintf("/content/%d/data", i),
+			})
+		}
+	}
+	return canon.JoinThinking(thinking), images
 }
 
 // piText takes the content array ALREADY decoded by the caller.

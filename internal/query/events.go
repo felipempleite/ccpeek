@@ -1,0 +1,617 @@
+package query
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/ahmedelgabri/ccpeek/internal/canon"
+)
+
+// parseKinds splits a comma-separated kind filter and validates it; an
+// unknown kind is a caller mistake, not an empty answer.
+func parseKinds(spec string) ([]string, error) {
+	if spec == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, k := range strings.Split(spec, ",") {
+		k = strings.TrimSpace(k)
+		if !slices.Contains(canon.EventKinds, canon.EventKind(k)) {
+			return nil, fmt.Errorf("%w: kind=%q (want one of %s)", ErrBadRequest, k, EventKindList())
+		}
+		out = append(out, k)
+	}
+	return out, nil
+}
+
+// EventKindList renders the filterable event kinds for messages and docs.
+func EventKindList() string {
+	names := make([]string, len(canon.EventKinds))
+	for i, k := range canon.EventKinds {
+		names[i] = string(k)
+	}
+	return strings.Join(names, ", ")
+}
+
+// eventWhere builds the clauses shared by the event reads.
+func eventWhere(kinds []string, agent, since, until string) ([]string, []any) {
+	var where []string
+	var args []any
+	if len(kinds) > 0 {
+		where = append(where, "e.kind IN ("+placeholders(len(kinds))+")")
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	return windowClauses(where, args, "e.at", agent, since, until)
+}
+
+// windowClauses appends the agent filter and the [since, until] day window
+// on timeCol that every aggregate read accepts.
+func windowClauses(where []string, args []any, timeCol, agent, since, until string) ([]string, []any) {
+	if agent != "" {
+		where = append(where, "a.slug = ?")
+		args = append(args, agent)
+	}
+	if since != "" {
+		where = append(where, timeCol+" >= ?")
+		args = append(args, since)
+	}
+	if until != "" {
+		where = append(where, timeCol+" < ?")
+		args = append(args, exclusiveUntil(until))
+	}
+	return where, args
+}
+
+// placeholders returns n comma-separated bind markers for an IN list.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// limitClause returns a LIMIT for a positive limit (zero means all rows).
+func limitClause(limit int, args []any) (string, []any) {
+	if limit <= 0 {
+		return "", args
+	}
+	return "LIMIT ?", append(args, limit)
+}
+
+func whereClause(where []string) string {
+	if len(where) == 0 {
+		return ""
+	}
+	return "WHERE " + strings.Join(where, " AND ")
+}
+
+// EventsFilter narrows the session-events op. Kind is a comma-separated
+// list; Session (an external id) scopes to one session and needs Agent.
+// Sort is "time" (newest first, the default) or "duration" (longest
+// first).
+type EventsFilter struct {
+	Kind    string
+	Status  string // comma-separated outcomes (ok, error, blocked, an HTTP status …)
+	Agent   string
+	Session string
+	Since   string
+	Until   string
+	Sort    string
+	Limit   int
+	Offset  int
+}
+
+var eventOrders = map[string]string{
+	"time":     "e.at DESC, e.id DESC",
+	"duration": "e.duration_ms DESC, e.id DESC",
+}
+
+// EventRow is one session event with the session it belongs to.
+type EventRow struct {
+	Agent        string          `json:"agent"`
+	SessionID    string          `json:"sessionId"`
+	SessionTitle string          `json:"sessionTitle"`
+	MessageSeq   int             `json:"messageSeq"`
+	Kind         string          `json:"kind"`
+	At           string          `json:"at,omitempty"`
+	Label        string          `json:"label,omitempty"`
+	Status       string          `json:"status,omitempty"`
+	DurationMs   int64           `json:"durationMs,omitempty"`
+	Detail       string          `json:"detail,omitempty"`
+	Payload      json.RawMessage `json:"payload,omitempty"`
+}
+
+// Events lists session events newest first.
+func (s *Service) Events(ctx context.Context, f EventsFilter) ([]EventRow, error) {
+	if err := checkWindow(f.Since, f.Until); err != nil {
+		return nil, err
+	}
+	if err := checkOffset(f.Offset); err != nil {
+		return nil, err
+	}
+	if err := EventsLimit.apply(&f.Limit); err != nil {
+		return nil, err
+	}
+	kinds, err := parseKinds(f.Kind)
+	if err != nil {
+		return nil, err
+	}
+	if f.Sort == "" {
+		f.Sort = "time"
+	}
+	order, ok := eventOrders[f.Sort]
+	if !ok {
+		return nil, fmt.Errorf("%w: sort=%q (want time or duration)", ErrBadRequest, f.Sort)
+	}
+	where, args := eventWhere(kinds, f.Agent, f.Since, f.Until)
+	if f.Status != "" {
+		statuses := strings.Split(f.Status, ",")
+		where = append(where, "e.status IN ("+placeholders(len(statuses))+")")
+		for _, st := range statuses {
+			args = append(args, strings.TrimSpace(st))
+		}
+	}
+	if f.Session != "" {
+		if f.Agent == "" {
+			return nil, fmt.Errorf("%w: session needs agent (session ids are per agent)", ErrBadRequest)
+		}
+		rowID, err := s.sessionRowID(ctx, f.Agent, f.Session)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "e.session_id = ?")
+		args = append(args, rowID)
+	}
+	args = append(args, f.Limit, f.Offset)
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+		SELECT a.slug, se.external_id, se.title, e.message_seq, e.kind,
+		       COALESCE(e.at, ''), e.label, e.status, e.duration_ms, e.detail, e.payload_json
+		FROM session_events e
+		JOIN sessions se ON se.id = e.session_id
+		JOIN agents a ON a.id = se.agent_id
+		`+whereClause(where)+`
+		ORDER BY `+order+`
+		LIMIT ? OFFSET ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing session events: %w", err)
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		var r EventRow
+		var payload string
+		if err := rows.Scan(&r.Agent, &r.SessionID, &r.SessionTitle, &r.MessageSeq, &r.Kind,
+			&r.At, &r.Label, &r.Status, &r.DurationMs, &r.Detail, &payload); err != nil {
+			return nil, err
+		}
+		if payload != "" && payload != "{}" {
+			r.Payload = json.RawMessage(payload)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// EventStatsFilter narrows the event-stats op. GroupBy picks the second
+// dimension beside kind: label (default), status, agent, or day.
+type EventStatsFilter struct {
+	Kind    string
+	GroupBy string
+	Agent   string
+	Since   string
+	Until   string
+	Limit   int
+}
+
+// EventStat is one (kind, group) aggregate. Failures counts events whose
+// status is error or blocked (hooks).
+type EventStat struct {
+	Kind     string  `json:"kind"`
+	Group    string  `json:"group"`
+	Count    int     `json:"count"`
+	Failures int     `json:"failures"`
+	Sessions int     `json:"sessions"`
+	TotalMs  int64   `json:"totalMs,omitempty"`
+	AvgMs    float64 `json:"avgMs,omitempty"`
+	MaxMs    int64   `json:"maxMs,omitempty"`
+}
+
+var eventGroupExprs = map[string]string{
+	"label":  "e.label",
+	"status": "e.status",
+	"agent":  "a.slug",
+	"day":    "substr(COALESCE(e.at, ''), 1, 10)",
+	"detail": "e.detail",
+}
+
+// EventStats aggregates session events by kind and one more dimension,
+// largest groups first (days in date order).
+func (s *Service) EventStats(ctx context.Context, f EventStatsFilter) ([]EventStat, error) {
+	if err := checkWindow(f.Since, f.Until); err != nil {
+		return nil, err
+	}
+	if err := EventStatsLimit.apply(&f.Limit); err != nil {
+		return nil, err
+	}
+	if f.GroupBy == "" {
+		f.GroupBy = "label"
+	}
+	groupExpr, ok := eventGroupExprs[f.GroupBy]
+	if !ok {
+		return nil, fmt.Errorf("%w: group=%q (want label, status, agent, day, or detail)", ErrBadRequest, f.GroupBy)
+	}
+	kinds, err := parseKinds(f.Kind)
+	if err != nil {
+		return nil, err
+	}
+	where, args := eventWhere(kinds, f.Agent, f.Since, f.Until)
+	order := "COUNT(*) DESC, e.kind, g"
+	if f.GroupBy == "day" {
+		order = "g, e.kind"
+	}
+	limit, args := limitClause(f.Limit, args)
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+		SELECT e.kind, `+groupExpr+` AS g, COUNT(*), SUM(e.status IN ('error', 'blocked')),
+		       COUNT(DISTINCT e.session_id),
+		       SUM(e.duration_ms), AVG(e.duration_ms), MAX(e.duration_ms)
+		FROM session_events e
+		JOIN sessions se ON se.id = e.session_id
+		JOIN agents a ON a.id = se.agent_id
+		`+whereClause(where)+`
+		GROUP BY e.kind, g
+		ORDER BY `+order+` `+limit, args...)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating session events: %w", err)
+	}
+	defer rows.Close()
+	var out []EventStat
+	for rows.Next() {
+		var st EventStat
+		if err := rows.Scan(&st.Kind, &st.Group, &st.Count, &st.Failures, &st.Sessions,
+			&st.TotalMs, &st.AvgMs, &st.MaxMs); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ToolStatsFilter narrows the tool-stats op. Sort is "errors" (most
+// failures first, the default), "total" (most time spent first), or "avg"
+// (slowest on average first).
+type ToolStatsFilter struct {
+	Agent string
+	Since string
+	Until string
+	Sort  string
+	Limit int
+}
+
+// ToolStat is one tool's call, failure, and timing figures. Timing covers
+// only the Timed calls whose duration is known (result timestamps or the
+// agent's own figure).
+type ToolStat struct {
+	Name     string  `json:"name"`
+	Kind     string  `json:"kind"`
+	Calls    int     `json:"calls"`
+	Errors   int     `json:"errors"`
+	Sessions int     `json:"sessions"`
+	Timed    int     `json:"timed"`
+	TotalMs  int64   `json:"totalMs"`
+	AvgMs    float64 `json:"avgMs"`
+	MaxMs    int64   `json:"maxMs"`
+}
+
+var toolOrders = map[string]string{
+	"errors": "errors DESC, calls DESC, tc.name",
+	"total":  "total_ms DESC, tc.name",
+	"avg":    "avg_ms DESC, tc.name",
+}
+
+// ToolStats counts calls and failed results per tool, most failures first.
+func (s *Service) ToolStats(ctx context.Context, f ToolStatsFilter) ([]ToolStat, error) {
+	if err := checkWindow(f.Since, f.Until); err != nil {
+		return nil, err
+	}
+	if err := ToolStatsLimit.apply(&f.Limit); err != nil {
+		return nil, err
+	}
+	if f.Sort == "" {
+		f.Sort = "errors"
+	}
+	order, ok := toolOrders[f.Sort]
+	if !ok {
+		return nil, fmt.Errorf("%w: sort=%q (want errors, total, or avg)", ErrBadRequest, f.Sort)
+	}
+	where, args := windowClauses(nil, nil, "tc.started_at", f.Agent, f.Since, f.Until)
+	args = append(args, f.Limit)
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+		SELECT tc.name, tc.kind, COUNT(*) AS calls, SUM(tc.result_status = 'error') AS errors,
+		       COUNT(DISTINCT tc.session_id), COUNT(tc.duration_ms),
+		       COALESCE(SUM(tc.duration_ms), 0) AS total_ms,
+		       COALESCE(AVG(tc.duration_ms), 0) AS avg_ms,
+		       COALESCE(MAX(tc.duration_ms), 0)
+		FROM tool_calls tc
+		JOIN sessions se ON se.id = tc.session_id
+		JOIN agents a ON a.id = se.agent_id
+		`+whereClause(where)+`
+		GROUP BY tc.name, tc.kind
+		ORDER BY `+order+`
+		LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating tool calls: %w", err)
+	}
+	defer rows.Close()
+	var out []ToolStat
+	for rows.Next() {
+		var st ToolStat
+		if err := rows.Scan(&st.Name, &st.Kind, &st.Calls, &st.Errors, &st.Sessions,
+			&st.Timed, &st.TotalMs, &st.AvgMs, &st.MaxMs); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// attachEventCounts fills a session detail's per-kind event counts.
+func (s *Service) attachEventCounts(ctx context.Context, rowID int64, detail *SessionDetail) error {
+	rows, err := s.store.ReadDB().QueryContext(ctx,
+		`SELECT kind, COUNT(*) FROM session_events WHERE session_id = ? GROUP BY kind`, rowID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind string
+		var n int
+		if err := rows.Scan(&kind, &n); err != nil {
+			return err
+		}
+		if detail.Events == nil {
+			detail.Events = map[string]int{}
+		}
+		detail.Events[kind] = n
+	}
+	return rows.Err()
+}
+
+// ContextPoint is one model request: how much context it sent (input plus
+// cache reads and writes — the whole prompt) and how much it produced.
+type ContextPoint struct {
+	Seq          int    `json:"seq"`
+	At           string `json:"at,omitempty"`
+	PromptTokens int64  `json:"promptTokens"`
+	OutputTokens int64  `json:"outputTokens"`
+}
+
+// SessionContext is a session's context fill over its requests, with the
+// compactions that emptied it.
+type SessionContext struct {
+	Points      []ContextPoint `json:"points"`
+	Compactions []EventRow     `json:"compactions"`
+}
+
+// Context returns one session's prompt size per model request, in order,
+// with its compactions. Usage owned by another copy of a resumed turn
+// (see the usage dedupe) is absent from the copy.
+func (s *Service) Context(ctx context.Context, agentSlug, externalID string) (*SessionContext, error) {
+	rowID, err := s.sessionRowID(ctx, agentSlug, externalID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+		SELECT m.seq, COALESCE(m.created_at, ''),
+		       u.input_tokens + u.cache_read_tokens + u.cache_write_tokens, u.output_tokens
+		FROM message_usage u JOIN messages m ON m.id = u.message_id
+		WHERE m.session_id = ? AND m.role = 'assistant'
+		ORDER BY m.seq`, rowID)
+	if err != nil {
+		return nil, fmt.Errorf("reading context fill: %w", err)
+	}
+	defer rows.Close()
+	out := &SessionContext{Points: []ContextPoint{}}
+	for rows.Next() {
+		var p ContextPoint
+		if err := rows.Scan(&p.Seq, &p.At, &p.PromptTokens, &p.OutputTokens); err != nil {
+			return nil, err
+		}
+		out.Points = append(out.Points, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out.Compactions, err = s.Events(ctx, EventsFilter{
+		Kind: string(canon.EventCompaction), Agent: agentSlug, Session: externalID,
+		Limit: EventsLimit.Max,
+	})
+	if out.Compactions == nil {
+		out.Compactions = []EventRow{}
+	}
+	return out, err
+}
+
+// ChangesFilter narrows the changes op. GroupBy is day, agent, or file.
+type ChangesFilter struct {
+	GroupBy string
+	Agent   string
+	Since   string
+	Until   string
+	Limit   int
+}
+
+// ChangeRow is the size of the file changes in one group: lines added
+// and removed, how many changes, across how many files and sessions.
+type ChangeRow struct {
+	Group    string `json:"group"`
+	Added    int64  `json:"added"`
+	Removed  int64  `json:"removed"`
+	Changes  int    `json:"changes"`
+	Files    int    `json:"files"`
+	Sessions int    `json:"sessions"`
+}
+
+// changedFileExpr resolves a changed file against its session's working
+// directory: agents that pass relative paths (Pi) would otherwise merge
+// every repository's README.md into one row.
+const changedFileExpr = `CASE WHEN tc.file_path LIKE '/%' OR se.cwd = '' THEN tc.file_path
+	ELSE rtrim(se.cwd, '/') || '/' || tc.file_path END`
+
+var changeGroupExprs = map[string]string{
+	"day":   "substr(COALESCE(tc.started_at, ''), 1, 10)",
+	"agent": "a.slug",
+	"file":  changedFileExpr,
+}
+
+// Changes aggregates file changes whose size is known (tool calls with
+// line counts): churn per day, per agent, or the most-changed files.
+func (s *Service) Changes(ctx context.Context, f ChangesFilter) ([]ChangeRow, error) {
+	if err := checkWindow(f.Since, f.Until); err != nil {
+		return nil, err
+	}
+	if err := ChangesLimit.apply(&f.Limit); err != nil {
+		return nil, err
+	}
+	if f.GroupBy == "" {
+		f.GroupBy = "day"
+	}
+	groupExpr, ok := changeGroupExprs[f.GroupBy]
+	if !ok {
+		return nil, fmt.Errorf("%w: group=%q (want day, agent, or file)", ErrBadRequest, f.GroupBy)
+	}
+	where, args := windowClauses([]string{"tc.lines_added IS NOT NULL"}, nil,
+		"tc.started_at", f.Agent, f.Since, f.Until)
+	order := "SUM(tc.lines_added + tc.lines_removed) DESC, g"
+	if f.GroupBy == "day" {
+		order = "g"
+	}
+	limit, args := limitClause(f.Limit, args)
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+		SELECT `+groupExpr+` AS g, SUM(tc.lines_added), SUM(tc.lines_removed), COUNT(*),
+		       COUNT(DISTINCT `+changedFileExpr+`), COUNT(DISTINCT tc.session_id)
+		FROM tool_calls tc
+		JOIN sessions se ON se.id = tc.session_id
+		JOIN agents a ON a.id = se.agent_id
+		`+whereClause(where)+`
+		GROUP BY g
+		ORDER BY `+order+` `+limit, args...)
+	if err != nil {
+		return nil, fmt.Errorf("aggregating file changes: %w", err)
+	}
+	defer rows.Close()
+	var out []ChangeRow
+	for rows.Next() {
+		var r ChangeRow
+		if err := rows.Scan(&r.Group, &r.Added, &r.Removed, &r.Changes, &r.Files, &r.Sessions); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// LineTotals is one session's file churn.
+type LineTotals struct {
+	Added   int64 `json:"added"`
+	Removed int64 `json:"removed"`
+	Files   int   `json:"files"`
+}
+
+// attachLineTotals fills a session detail's file churn, when any change
+// in it has a known size.
+func (s *Service) attachLineTotals(ctx context.Context, rowID int64, detail *SessionDetail) error {
+	var t LineTotals
+	var n int
+	err := s.store.ReadDB().QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(lines_added), 0), COALESCE(SUM(lines_removed), 0),
+		       COUNT(DISTINCT file_path)
+		FROM tool_calls WHERE session_id = ? AND lines_added IS NOT NULL`, rowID).
+		Scan(&n, &t.Added, &t.Removed, &t.Files)
+	if err != nil || n == 0 {
+		return err
+	}
+	detail.Lines = &t
+	return nil
+}
+
+// EffortFilter narrows the effort op. GroupBy is level (per agent, the
+// default) or day.
+type EffortFilter struct {
+	GroupBy string
+	Agent   string
+	Since   string
+	Until   string
+}
+
+// EffortRow is the model requests run at one effort level — per agent, or
+// per day — with their tokens and cost. Level is "" where the agent did
+// not record one.
+type EffortRow struct {
+	Agent    string `json:"agent,omitempty"`
+	Day      string `json:"day,omitempty"`
+	Level    string `json:"level"`
+	Requests int    `json:"requests"`
+	CostTotals
+}
+
+// effortSep joins a group's two parts into one key; it cannot appear in a
+// slug, a date, or an effort level.
+const effortSep = "\x1f"
+
+// Effort splits model requests, tokens and cost by the reasoning effort or
+// thinking level they ran at.
+func (s *Service) Effort(ctx context.Context, f EffortFilter) ([]EffortRow, error) {
+	if err := checkWindow(f.Since, f.Until); err != nil {
+		return nil, err
+	}
+	if f.GroupBy == "" {
+		f.GroupBy = "level"
+	}
+	var first string
+	switch f.GroupBy {
+	case "level":
+		first = "a.slug"
+	case "day":
+		first = "substr(COALESCE(m.created_at, ''), 1, 10)"
+	default:
+		return nil, fmt.Errorf("%w: group=%q (want level or day)", ErrBadRequest, f.GroupBy)
+	}
+	key := first + " || char(31) || m.effort"
+	where, args := windowClauses([]string{"m.role = 'assistant'"}, nil,
+		"m.created_at", f.Agent, f.Since, f.Until)
+	rows, err := s.store.ReadDB().QueryContext(ctx, `
+		SELECT `+key+`, `+usageCostColumns+`
+		FROM message_usage u
+		JOIN messages m ON m.id = u.message_id
+		JOIN sessions se ON se.id = m.session_id
+		JOIN agents a ON a.id = se.agent_id
+		`+whereClause(where), args...)
+	if err != nil {
+		return nil, fmt.Errorf("pricing effort groups: %w", err)
+	}
+	groups := map[string]*costAcc{}
+	err = s.priceUsageRows(rows, func(k string) *costAcc {
+		if groups[k] == nil {
+			groups[k] = &costAcc{}
+		}
+		return groups[k]
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EffortRow, 0, len(groups))
+	for _, k := range slices.Sorted(maps.Keys(groups)) {
+		head, level, _ := strings.Cut(k, effortSep)
+		row := EffortRow{Level: level, Requests: groups[k].rows, CostTotals: groups[k].totals()}
+		if f.GroupBy == "day" {
+			row.Day = head
+		} else {
+			row.Agent = head
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}

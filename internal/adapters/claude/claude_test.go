@@ -2,6 +2,7 @@ package claude
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -147,6 +148,27 @@ func TestParseCapturesUsageAndModel(t *testing.T) {
 	// Tree edges preserved.
 	if first.ParentExternalID != "u-001" || first.ExternalID != "a-001" {
 		t.Errorf("tree edge = %q→%q", first.ParentExternalID, first.ExternalID)
+	}
+}
+
+func TestCacheWriteTTLAndLegacyCostOnly(t *testing.T) {
+	cost := 0.25
+	withUsage, _, _ := New().convertLine(rawLine{
+		Type: "assistant", RequestID: "req", CostUSD: &cost,
+		Message: json.RawMessage(`{"id":"msg","role":"assistant","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":3,"output_tokens":4,"cache_creation_input_tokens":100,"cache_read_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":40,"ephemeral_1h_input_tokens":60}}}`),
+	}, 0, "s")
+	if withUsage.Usage == nil || withUsage.Usage.CacheWriteTokens != 100 ||
+		withUsage.Usage.CacheWrite1hTokens != 60 {
+		t.Fatalf("ttl usage = %+v", withUsage.Usage)
+	}
+
+	costOnly, _, _ := New().convertLine(rawLine{
+		Type: "assistant", CostUSD: &cost,
+		Message: json.RawMessage(`{"id":"legacy","role":"assistant","model":"claude-2","content":[]}`),
+	}, 1, "s")
+	if costOnly.Usage == nil || costOnly.Usage.ReportedCostUSD == nil ||
+		*costOnly.Usage.ReportedCostUSD != cost {
+		t.Fatalf("legacy cost-only usage = %+v", costOnly.Usage)
 	}
 }
 
@@ -298,6 +320,85 @@ func appendTo(t *testing.T, path, data string) {
 		t.Fatal(err)
 	}
 	f.Close()
+}
+
+func TestSessionTitleSkipsSyntheticLocalCommands(t *testing.T) {
+	src, path := tailFixture(t)
+	body := `{"type":"user","uuid":"u-1","timestamp":"2026-07-01T10:00:00Z","message":{"role":"user","content":"<bash-input>nix-collect-garbage -d</bash-input>"}}
+{"type":"user","uuid":"u-2","timestamp":"2026-07-01T10:00:01Z","message":{"role":"user","content":"<command-name>/clear</command-name>"}}
+{"type":"user","uuid":"u-3","timestamp":"2026-07-01T10:00:02Z","message":{"role":"user","content":"explain the failing build"}}
+`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.Sessions[len(sink.Sessions)-1].Title
+	if got != "explain the failing build" {
+		t.Fatalf("session title = %q, want first real prompt", got)
+	}
+}
+
+func TestSessionTitlePrefersNativeMetadata(t *testing.T) {
+	src, path := tailFixture(t)
+	appendTo(t, path, `{"type":"ai-title","aiTitle":"AI summary","sessionId":"99999999-aaaa-bbbb-cccc-999999999999"}
+{"type":"custom-title","customTitle":"user-assigned-name","sessionId":"99999999-aaaa-bbbb-cccc-999999999999"}
+`)
+
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Sessions) == 0 {
+		t.Fatal("no session emitted")
+	}
+	got := sink.Sessions[len(sink.Sessions)-1]
+	if got.Title != "user-assigned-name" || !got.TitleOverride {
+		t.Fatalf("session title = %q override=%v, want custom title override", got.Title, got.TitleOverride)
+	}
+}
+
+func TestParseTailEmitsCustomTitleWithoutMessages(t *testing.T) {
+	src, path := tailFixture(t)
+	state, err := New().ParseTail(context.Background(), src, agent.TailState{}, &agenttest.Sink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendTo(t, path, `{"type":"custom-title","customTitle":"renamed-later","sessionId":"99999999-aaaa-bbbb-cccc-999999999999"}
+`)
+
+	sink := &agenttest.Sink{}
+	if _, err := New().ParseTail(context.Background(), src, state, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Messages) != 0 || len(sink.Sessions) != 1 {
+		t.Fatalf("tail emitted %d messages and %d sessions, want metadata-only session update", len(sink.Messages), len(sink.Sessions))
+	}
+	if got := sink.Sessions[0]; got.Title != "renamed-later" || !got.TitleOverride {
+		t.Fatalf("tail title = %q override=%v, want explicit rename", got.Title, got.TitleOverride)
+	}
+}
+
+func TestClaudePromptTitleSkipsSyntheticLocalCommands(t *testing.T) {
+	for _, text := range []string{
+		"<local-command-caveat>Caveat: generated locally</local-command-caveat>",
+		"<command-name>/clear</command-name>",
+		"<local-command-stdout></local-command-stdout>",
+		"<bash-input>nix-collect-garbage -d</bash-input>",
+		"<bash-stdout>store paths deleted</bash-stdout>",
+		"<bash-stderr>warning</bash-stderr>",
+		"<system-reminder>metadata</system-reminder>",
+	} {
+		if got := claudePromptTitle(text); got != "" {
+			t.Errorf("claudePromptTitle(%q) = %q, want empty", text, got)
+		}
+	}
+	if got := claudePromptTitle("  explain the failing build  "); got != "explain the failing build" {
+		t.Errorf("real prompt title = %q", got)
+	}
 }
 
 func TestParseTailEmitsOnlyAppendedRecords(t *testing.T) {
@@ -524,5 +625,284 @@ func TestMatchingSessionIDIsSilent(t *testing.T) {
 				t.Errorf("unexpected identity warning on %s: %+v", ref.Path, is)
 			}
 		}
+	}
+}
+
+// Subagent transcripts live beside their parent session and were never
+// discovered, so their turns — and their cost — were missing. Each must
+// become its own session linked back to whoever spawned it: the main
+// session, or the parent subagent named by meta.json. Their lines carry the
+// parent's sessionId by design, which must not read as a renamed file.
+func TestSubagentTranscriptsBecomeLinkedSessions(t *testing.T) {
+	const parent = "11111111-2222-3333-4444-555555555555"
+	root := t.TempDir()
+	sessDir := filepath.Join(root, "projects", "-w", parent)
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(sessDir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	line := func(typ, uuid string) string {
+		return `{"type":"` + typ + `","isSidechain":true,"sessionId":"` + parent + `","uuid":"` + uuid +
+			`","timestamp":"2026-10-01T10:00:00Z","message":{"role":"` + typ + `","content":"do the thing"}}` + "\n"
+	}
+	write("../"+parent+".jsonl", strings.Replace(line("user", "p1"), `"isSidechain":true`, `"isSidechain":false`, 1))
+	write("subagents/agent-a1.jsonl", line("user", "s1")+line("assistant", "s2"))
+	write("subagents/agent-a1.meta.json", `{"agentType":"Explore","description":"Map the indexer","toolUseId":"toolu_1"}`)
+	write("subagents/workflows/wf_1/agent-b2.jsonl", line("user", "w1"))
+	write("subagents/workflows/wf_1/agent-b2.meta.json", `{"agentType":"workflow-subagent","parentAgentId":"a1"}`)
+	write("subagents/workflows/wf_1/journal.jsonl", "{}\n")
+
+	r := agent.Root{Agent: Slug, Path: root}
+	refs, err := New().Discover(context.Background(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	for _, ref := range refs {
+		if err := New().Parse(context.Background(), ref, sink); err != nil {
+			t.Fatalf("Parse %s: %v", ref.Path, err)
+		}
+	}
+
+	titles := map[string]string{}
+	for _, s := range sink.Sessions {
+		titles[s.ExternalID] = s.Title
+	}
+	if len(titles) != 3 || titles["agent-a1"] != "Map the indexer" || titles["agent-b2"] != "do the thing" {
+		t.Errorf("sessions = %v, want the parent plus agent-a1 (titled by its description) and agent-b2", titles)
+	}
+	edges := map[string]string{}
+	for _, rel := range sink.Relations {
+		if rel.Kind == canon.RelSubagentOf {
+			edges[rel.FromExternalID] = rel.ToExternalID
+		}
+	}
+	if edges["agent-a1"] != parent || edges["agent-b2"] != "agent-a1" {
+		t.Errorf("subagent_of edges = %v", edges)
+	}
+	for _, m := range sink.Messages {
+		if m.IsSidechain {
+			t.Errorf("message %s still flagged sidechain inside its own session", m.ExternalID)
+		}
+	}
+	if len(sink.Issues) != 0 {
+		t.Errorf("issues = %+v, want none (parent sessionId is expected)", sink.Issues)
+	}
+}
+
+// The oldest layout kept subagents beside their parent as
+// projects/<p>/agent-<id>.jsonl with no meta.json; their lines carry the
+// parent's sessionId, which is the only link there is.
+func TestLegacyTopLevelSubagentLinksByLineSessionID(t *testing.T) {
+	const parent = "66666666-2222-3333-4444-555555555555"
+	root := t.TempDir()
+	dir := filepath.Join(root, "projects", "-w")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"user","isSidechain":true,"sessionId":"` + parent + `","uuid":"s1","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"look around"}}` + "\n"
+	path := filepath.Join(dir, "agent-abc1234.jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	src := agent.SourceRef{Root: agent.Root{Agent: Slug, Path: root}, Path: path, Kind: agent.SourceFile}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Relations) != 1 || sink.Relations[0].Kind != canon.RelSubagentOf ||
+		sink.Relations[0].FromExternalID != "agent-abc1234" || sink.Relations[0].ToExternalID != parent {
+		t.Errorf("relations = %+v, want agent-abc1234 subagent_of the line sessionId", sink.Relations)
+	}
+	if len(sink.Issues) != 0 {
+		t.Errorf("issues = %+v, want none", sink.Issues)
+	}
+	if got := sink.Sessions[len(sink.Sessions)-1].Title; got != "look around" {
+		t.Errorf("title = %q, want the first prompt", got)
+	}
+}
+
+// Resuming a session under a new id copies its history in, every line
+// still carrying the id it was written under; a chain of resumes copies
+// all ancestors, oldest first. The direct parent is the LAST foreign id,
+// and its last copied entry is where this session branched off. That is
+// lineage, not a renamed file, so it must not raise the identity warning.
+func TestCopiedHistoryLinksTheDirectParent(t *testing.T) {
+	const (
+		root1 = "11111111-0000-0000-0000-000000000001"
+		root2 = "22222222-0000-0000-0000-000000000002"
+		self  = "33333333-0000-0000-0000-000000000003"
+	)
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects", "-w")
+	if err := os.MkdirAll(projects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := func(session, uuid string) string {
+		return `{"type":"user","uuid":"` + uuid + `","sessionId":"` + session +
+			`","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}` + "\n"
+	}
+	path := filepath.Join(projects, self+".jsonl")
+	if err := os.WriteFile(path, []byte(line(root1, "a")+line(root2, "b")+line(root2, "c")+line(self, "d")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	src := agent.SourceRef{Root: agent.Root{Agent: Slug, Path: dir}, Path: path, Kind: agent.SourceFile}
+	if err := New().Parse(context.Background(), src, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Relations) != 1 {
+		t.Fatalf("relations = %+v, want one resumed_from edge", sink.Relations)
+	}
+	rel := sink.Relations[0]
+	var ev struct {
+		BranchUUID string `json:"branchUuid"`
+	}
+	_ = json.Unmarshal(rel.Evidence, &ev)
+	if rel.Kind != canon.RelResumedFrom || rel.FromExternalID != self || rel.ToExternalID != root2 || ev.BranchUUID != "c" {
+		t.Errorf("relation = %+v (branch %q), want %s resumed_from %s at c", rel, ev.BranchUUID, self, root2)
+	}
+	if len(sink.Issues) != 0 {
+		t.Errorf("issues = %+v, want none for copied history", sink.Issues)
+	}
+}
+
+// A legacy subagent can outlive a resume of its parent, so its lines name
+// two parent ids. Neither is copied history: no resume edge, no warning.
+func TestSubagentSpanningAParentResumeIsNotACopy(t *testing.T) {
+	const parent, resumed = "12121212-0000-0000-0000-000000000001", "12121212-0000-0000-0000-000000000002"
+	root := t.TempDir()
+	dir := filepath.Join(root, "projects", "-w")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := func(session, uuid string) string {
+		return `{"type":"user","isSidechain":true,"sessionId":"` + session + `","uuid":"` + uuid +
+			`","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"go"}}` + "\n"
+	}
+	path := filepath.Join(dir, "agent-feed123.jsonl")
+	if err := os.WriteFile(path, []byte(line(parent, "a")+line(resumed, "b")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Root: agent.Root{Agent: Slug, Path: root}, Path: path, Kind: agent.SourceFile}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Relations) != 1 || sink.Relations[0].Kind != canon.RelSubagentOf || sink.Relations[0].ToExternalID != parent {
+		t.Errorf("relations = %+v, want only subagent_of the first parent", sink.Relations)
+	}
+	if len(sink.Issues) != 0 {
+		t.Errorf("issues = %+v, want none", sink.Issues)
+	}
+}
+
+// Failed requests, interrupted turns and refused tool calls are written as
+// ordinary-looking transcript lines; each must also surface as an event
+// anchored to its line, so errors can be counted across sessions.
+func TestErrorAbortAndDenialLinesBecomeEvents(t *testing.T) {
+	const id = "77777777-0000-0000-0000-000000000001"
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects", "-w")
+	if err := os.MkdirAll(projects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	head := `"sessionId":"` + id + `","timestamp":"2026-10-01T10:00:00Z",`
+	body := `{"type":"assistant",` + head + `"uuid":"e1","isApiErrorMessage":true,"apiErrorStatus":429,"error":"rate_limit","quotaLimits":{"rateLimitType":"five_hour"},"message":{"id":"x","role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit"}]}}` + "\n" +
+		`{"type":"user",` + head + `"uuid":"e2","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}` + "\n" +
+		`{"type":"user",` + head + `"uuid":"e3","toolDenialKind":"user-rejected","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"The user doesn't want to proceed"}]}}` + "\n"
+	path := filepath.Join(projects, id+".jsonl")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Root: agent.Root{Agent: Slug, Path: dir}, Path: path, Kind: agent.SourceFile}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.Events) != 3 {
+		t.Fatalf("events = %+v, want 3", sink.Events)
+	}
+	apiErr, abort, denial := sink.Events[0], sink.Events[1], sink.Events[2]
+	if apiErr.Kind != canon.EventAPIError || apiErr.Label != "rate_limit" || apiErr.Status != "429" ||
+		apiErr.MessageSeq != 0 || !strings.Contains(string(apiErr.Payload), "five_hour") {
+		t.Errorf("api error = %+v", apiErr)
+	}
+	if abort.Kind != canon.EventAborted || abort.MessageSeq != 1 {
+		t.Errorf("abort = %+v", abort)
+	}
+	if denial.Kind != canon.EventToolDenied || denial.Label != "user-rejected" || !strings.Contains(denial.Detail, "proceed") {
+		t.Errorf("denial = %+v", denial)
+	}
+}
+
+// Claude Code writes a pr-link line every time it checks a PR, sometimes
+// before the session's first message. One event per PR must come out,
+// anchored to the transcript, whatever order the lines arrive in.
+func TestPRLinksBecomeOneEventPerPR(t *testing.T) {
+	const id = "99999999-0000-0000-0000-000000000001"
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects", "-w")
+	if err := os.MkdirAll(projects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pr := func(n int) string {
+		return `{"type":"pr-link","sessionId":"` + id + `","prNumber":` + strconv.Itoa(n) +
+			`,"prUrl":"https://github.com/o/r/pull/` + strconv.Itoa(n) + `","prRepository":"o/r","timestamp":"2026-10-01T10:00:00Z"}` + "\n"
+	}
+	msg := `{"type":"user","sessionId":"` + id + `","uuid":"u1","timestamp":"2026-10-01T10:00:01Z","message":{"role":"user","content":"ship it"}}` + "\n"
+	path := filepath.Join(projects, id+".jsonl")
+	if err := os.WriteFile(path, []byte(pr(7)+msg+pr(7)+pr(7)+pr(8)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Root: agent.Root{Agent: Slug, Path: dir}, Path: path, Kind: agent.SourceFile}, sink); err != nil {
+		t.Fatal(err)
+	}
+	var urls []string
+	for _, e := range sink.Events {
+		if e.Kind == canon.EventPRLink {
+			urls = append(urls, e.Detail)
+			if e.Label != "o/r" || e.SessionExternalID != id {
+				t.Errorf("pr event = %+v", e)
+			}
+		}
+	}
+	if want := "https://github.com/o/r/pull/7,https://github.com/o/r/pull/8"; strings.Join(urls, ",") != want {
+		t.Errorf("pr urls = %v, want one event each for #7 and #8", urls)
+	}
+}
+
+// Claude Code 2.0 wrote the local-command caveat as a plain user line
+// flagged isMeta, before the <local-command-caveat> wrapper existed; six
+// local sessions were titled "Caveat: The messages below were generated…".
+// Meta lines are injected, so the user's first real prompt is the title.
+func TestMetaLinesNeverTitleASession(t *testing.T) {
+	const id = "abababab-0000-0000-0000-000000000001"
+	dir := t.TempDir()
+	projects := filepath.Join(dir, "projects", "-w")
+	if err := os.MkdirAll(projects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := func(uuid, meta, text string) string {
+		return `{"type":"user","sessionId":"` + id + `","uuid":"` + uuid + `",` + meta +
+			`"timestamp":"2026-01-11T15:00:00Z","message":{"role":"user","content":"` + text + `"}}` + "\n"
+	}
+	body := line("a", `"isMeta":true,`, "Caveat: The messages below were generated by the user while running local commands.") +
+		line("b", "", "Fix the flaky login test")
+	path := filepath.Join(projects, id+".jsonl")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sink := &agenttest.Sink{}
+	if err := New().Parse(context.Background(), agent.SourceRef{Root: agent.Root{Agent: Slug, Path: dir}, Path: path, Kind: agent.SourceFile}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if got := sink.Sessions[len(sink.Sessions)-1].Title; got != "Fix the flaky login test" {
+		t.Errorf("title = %q, want the first real prompt", got)
 	}
 }

@@ -78,16 +78,20 @@ func Routes() []Route {
 		{"GET /api/v1/health", "", "transport", nil},
 		{"GET /api/v1/ready", "", "transport", nil},
 		{"GET /api/v1/events", "", "transport", nil},
-		{"GET /api/v1/artifacts/{agent}/{kind}/{name}/raw", "", "transport", nil}, // raw bytes + CSP sandbox
+		{"GET /api/v1/artifacts/{agent}/{kind}/{name}/raw", "", "transport", nil},                   // raw bytes + CSP sandbox
+		{"GET /api/v1/sessions/{agent}/{id}/transcript/{seq}/images/{index}", "", "transport", nil}, // image bytes
 		{"GET /api/v1/stats", "stats", "op", nil},
+		{"GET /api/v1/archive-status", "archive-status", "op", nil},
 		{"GET /api/v1/sessions", "sessions", "op", nil},
 		{"GET /api/v1/sessions/{agent}/{id}", "session", "op", nil},
 		{"GET /api/v1/sessions/{agent}/{id}/transcript", "transcript", "op", nil},
 		{"GET /api/v1/sessions/{agent}/{id}/tools", "tools", "op", nil},
 		{"GET /api/v1/sessions/{agent}/{id}/tools/{seq}", "tool", "op", nil},
+		{"GET /api/v1/sessions/{agent}/{id}/context", "context", "op", nil},
 		{"GET /api/v1/commands", "commands", "op", []string{"format"}}, // shell-history download
 		{"GET /api/v1/history", "history", "op", nil},
 		{"GET /api/v1/usage", "usage", "op", nil},
+		{"GET /api/v1/pricing", "pricing", "op", nil},
 		{"GET /api/v1/search", "search", "op", nil},
 		{"GET /api/v1/artifacts", "artifacts", "op", nil},
 		{"GET /api/v1/artifacts/kinds", "artifact-kinds", "op", nil},
@@ -95,6 +99,11 @@ func Routes() []Route {
 		{"GET /api/v1/scan", "scan", "op", nil},
 		{"GET /api/v1/scan/rules", "scan-rules", "op", nil},
 		{"GET /api/v1/blocks", "blocks", "op", nil},
+		{"GET /api/v1/session-events", "session-events", "op", nil},
+		{"GET /api/v1/session-events/stats", "event-stats", "op", nil},
+		{"GET /api/v1/tool-stats", "tool-stats", "op", nil},
+		{"GET /api/v1/changes", "changes", "op", nil},
+		{"GET /api/v1/effort", "effort", "op", nil},
 		{"POST /api/v1/scan/{id}/ignore", "", "write", nil},
 	}
 }
@@ -128,32 +137,42 @@ type Deps struct {
 }
 
 // Handler mounts the API routes over svc, with d supplying the
-// server-state hooks (see Deps; the zero value is valid).
+// server-state hooks (see Deps; the zero value is valid). A nil svc serves
+// health, readiness and SSE while the archive opens; data routes answer 503.
 func Handler(svc *query.Service, d Deps) http.Handler {
 	mux := http.NewServeMux()
 	h := &handlers{svc: svc, deps: d}
 	byPattern := map[string]http.HandlerFunc{
-		"GET /api/v1/health":                              h.health,
-		"GET /api/v1/ready":                               h.readiness,
-		"GET /api/v1/stats":                               h.stats,
-		"GET /api/v1/sessions":                            h.sessions,
-		"GET /api/v1/sessions/{agent}/{id}":               h.session,
-		"GET /api/v1/sessions/{agent}/{id}/transcript":    h.transcript,
-		"GET /api/v1/sessions/{agent}/{id}/tools":         h.sessionTools,
-		"GET /api/v1/sessions/{agent}/{id}/tools/{seq}":   h.sessionTool,
-		"GET /api/v1/commands":                            h.commands,
-		"GET /api/v1/history":                             h.history,
-		"GET /api/v1/usage":                               h.usage,
-		"GET /api/v1/search":                              h.search,
-		"GET /api/v1/events":                              h.events,
-		"GET /api/v1/artifacts":                           h.artifacts,
-		"GET /api/v1/artifacts/kinds":                     h.artifactKinds,
-		"GET /api/v1/artifacts/{agent}/{kind}/{name}":     h.artifact,
-		"GET /api/v1/artifacts/{agent}/{kind}/{name}/raw": h.artifactRaw,
-		"GET /api/v1/scan":                                h.scanFindings,
-		"GET /api/v1/scan/rules":                          h.scanRules,
-		"POST /api/v1/scan/{id}/ignore":                   sameOriginOnly(h.scanIgnore),
-		"GET /api/v1/blocks":                              h.blocks,
+		"GET /api/v1/health":                           h.health,
+		"GET /api/v1/ready":                            h.readiness,
+		"GET /api/v1/stats":                            h.stats,
+		"GET /api/v1/archive-status":                   h.archiveStatus,
+		"GET /api/v1/sessions":                         h.sessions,
+		"GET /api/v1/sessions/{agent}/{id}":            h.session,
+		"GET /api/v1/sessions/{agent}/{id}/transcript": h.transcript,
+		"GET /api/v1/sessions/{agent}/{id}/transcript/{seq}/images/{index}": h.messageImage,
+		"GET /api/v1/sessions/{agent}/{id}/tools":                           h.sessionTools,
+		"GET /api/v1/sessions/{agent}/{id}/tools/{seq}":                     h.sessionTool,
+		"GET /api/v1/sessions/{agent}/{id}/context":                         h.sessionContext,
+		"GET /api/v1/commands":                                              h.commands,
+		"GET /api/v1/history":                                               h.history,
+		"GET /api/v1/usage":                                                 h.usage,
+		"GET /api/v1/pricing":                                               h.pricing,
+		"GET /api/v1/search":                                                h.search,
+		"GET /api/v1/events":                                                h.events,
+		"GET /api/v1/artifacts":                                             h.artifacts,
+		"GET /api/v1/artifacts/kinds":                                       h.artifactKinds,
+		"GET /api/v1/artifacts/{agent}/{kind}/{name}":                       h.artifact,
+		"GET /api/v1/artifacts/{agent}/{kind}/{name}/raw":                   h.artifactRaw,
+		"GET /api/v1/scan":                                                  h.scanFindings,
+		"GET /api/v1/scan/rules":                                            h.scanRules,
+		"POST /api/v1/scan/{id}/ignore":                                     h.scanIgnore,
+		"GET /api/v1/blocks":                                                h.blocks,
+		"GET /api/v1/session-events":                                        h.sessionEvents,
+		"GET /api/v1/session-events/stats":                                  h.eventStats,
+		"GET /api/v1/tool-stats":                                            h.toolStats,
+		"GET /api/v1/changes":                                               h.changes,
+		"GET /api/v1/effort":                                                h.effort,
 	}
 	for _, r := range Routes() {
 		fn, ok := byPattern[r.Pattern]
@@ -168,6 +187,19 @@ func Handler(svc *query.Service, d Deps) http.Handler {
 			fn = rejectUnknownParams(AcceptedParams(r, op), fn)
 		} else if len(r.Extra) > 0 {
 			panic("api: route " + r.Pattern + " declares query parameters but is not an op route")
+		}
+		if svc == nil && r.Pattern != "GET /api/v1/health" && r.Pattern != "GET /api/v1/ready" && r.Pattern != "GET /api/v1/events" {
+			fn = func(w http.ResponseWriter, r *http.Request) {
+				if _, bootstrap := h.outcomes(); bootstrap.State == "failed" {
+					writeEnvelope(w, http.StatusServiceUnavailable, ops.Envelope{Error: "archive initialization failed"})
+					return
+				}
+				w.Header().Set("Retry-After", "1")
+				writeEnvelope(w, http.StatusServiceUnavailable, ops.Envelope{Error: "archive is initializing"})
+			}
+		}
+		if r.Kind == "write" {
+			fn = sameOriginOnly(fn)
 		}
 		mux.HandleFunc(r.Pattern, fn)
 		delete(byPattern, r.Pattern)
@@ -245,7 +277,7 @@ type handlers struct {
 }
 
 func (h *handlers) isReady() bool {
-	return h.deps.Ready == nil || h.deps.Ready()
+	return h.svc != nil && (h.deps.Ready == nil || h.deps.Ready())
 }
 
 // outcomes reads both recorded outcomes in ONE call, or zero values when
@@ -257,11 +289,30 @@ func (h *handlers) outcomes() (V1ImportStatus, BootstrapStatus) {
 	return h.deps.Outcomes()
 }
 
+func (h *handlers) archiveStatus(w http.ResponseWriter, r *http.Request) {
+	status, err := h.svc.ArchiveStatus(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
 func (h *handlers) health(w http.ResponseWriter, r *http.Request) {
 	indexing := !h.isReady()
 	payload := map[string]any{
 		"status":   "ok",
 		"indexing": indexing,
+	}
+	if h.svc == nil {
+		payload["initializing"] = true
+	} else {
+		archive, err := h.svc.ArchiveStatus(r.Context())
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		payload["archive"] = archive
 	}
 	if indexing && h.deps.Progress != nil {
 		payload["progress"] = h.deps.Progress()
@@ -282,7 +333,9 @@ func (h *handlers) health(w http.ResponseWriter, r *http.Request) {
 // readiness at 503 ("v1-import-failed"): the index is genuinely
 // incomplete without the legacy data, and anything blocking on this
 // endpoint would otherwise read partial history as ready. Health keeps
-// answering 200 with the failure detail throughout.
+// answering 200 with the failure detail throughout. A durable running row
+// also holds readiness: another process may still be indexing, or a killed
+// pass may have left it unfinished even though this process is ready.
 func (h *handlers) readiness(w http.ResponseWriter, r *http.Request) {
 	v1Import, bootstrap := h.outcomes()
 	if !h.isReady() {
@@ -294,11 +347,28 @@ func (h *handlers) readiness(w http.ResponseWriter, r *http.Request) {
 				map[string]string{"status": "index-failed", "error": bootstrap.Error})
 			return
 		}
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "indexing"})
+		status := "indexing"
+		if h.svc == nil {
+			status = "initializing"
+		}
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": status})
 		return
 	}
 	if v1Import.State == "failed" {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "v1-import-failed"})
+		return
+	}
+	archive, err := h.svc.ArchiveStatus(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if archive.LastRun != nil && archive.LastRun.Status == "running" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "index-unfinished"})
+		return
+	}
+	if archive.LastRun != nil && (archive.LastRun.Status == "partial" || archive.LastRun.Status == "failed") {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "index-partial"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
@@ -307,14 +377,15 @@ func (h *handlers) readiness(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) sessions(w http.ResponseWriter, r *http.Request) {
 	p := newParams(r)
 	f := query.SessionsFilter{
-		Agent:   p.Str("agent"),
-		Project: p.Str("project"),
-		Model:   p.Str("model"),
-		Since:   p.Str("since"),
-		Until:   p.Str("until"),
-		Query:   p.Str("query"),
-		Limit:   p.Int("limit"),
-		Offset:  p.Int("offset"),
+		Agent:     p.Str("agent"),
+		Project:   p.Str("project"),
+		Model:     p.Str("model"),
+		Since:     p.Str("since"),
+		Until:     p.Str("until"),
+		Query:     p.Str("query"),
+		Subagents: p.Bool("subagents"),
+		Limit:     p.Int("limit"),
+		Offset:    p.Int("offset"),
 	}
 	if err := p.Err(); err != nil {
 		writeBadRequest(w, err)
@@ -340,9 +411,10 @@ func (h *handlers) session(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) transcript(w http.ResponseWriter, r *http.Request) {
 	p := newParams(r)
 	opts := query.TranscriptOptions{
-		FromSeq: p.Int("from_seq"),
-		Limit:   p.Int("limit"),
-		Full:    p.Bool("full"),
+		FromSeq:  p.Int("from_seq"),
+		Limit:    p.Int("limit"),
+		Full:     p.Bool("full"),
+		Thinking: p.Bool("thinking"),
 	}
 	if err := p.Err(); err != nil {
 		writeBadRequest(w, err)
@@ -537,6 +609,21 @@ func (h *handlers) usage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+func (h *handlers) pricing(w http.ResponseWriter, r *http.Request) {
+	p := newParams(r)
+	model, at, inputTokens := p.Str("model"), p.Str("at"), p.Int("input_tokens")
+	if err := p.Err(); err != nil {
+		writeBadRequest(w, err)
+		return
+	}
+	info, err := h.svc.PricingAt(r.Context(), model, at, int64(inputTokens))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
 }
 
 func (h *handlers) search(w http.ResponseWriter, r *http.Request) {

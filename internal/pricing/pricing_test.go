@@ -4,6 +4,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/ahmedelgabri/ccpeek/internal/canon"
 )
@@ -72,6 +73,48 @@ func TestCost(t *testing.T) {
 	}
 }
 
+func TestPartialCachePricingAndOneHourTTL(t *testing.T) {
+	tbl, err := Parse([]byte(`{
+		"source":"test","fetched_at":"2026-08-21T00:00:00Z",
+		"models":{
+			"full":{"input":1,"output":2,"cache_write":3,"cache_write_1h":4,"cache_read":5},
+			"partial":{"input":1,"output":2}
+		}}
+	`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := canon.Usage{
+		InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3,
+		CacheWriteTokens: 11, CacheWrite1hTokens: 7,
+	}
+	full, _ := tbl.Lookup("full")
+	if cost, unpriced := full.Price(u); cost != 1+4+15+12+28 ||
+		unpriced != (canon.Usage{}) {
+		t.Errorf("full price = %v, unpriced %+v", cost, unpriced)
+	}
+	partial, _ := tbl.Lookup("partial")
+	if cost, unpriced := partial.Price(u); cost != 5 ||
+		unpriced.CacheReadTokens != 3 || unpriced.CacheWriteTokens != 11 {
+		t.Errorf("partial price = %v, unpriced %+v; want cost 5, cache read/write 3/11", cost, unpriced)
+	}
+}
+
+func TestFingerprintCoversSnapshotAndAlgorithm(t *testing.T) {
+	a := syntheticTable(t)
+	b := syntheticTable(t)
+	if a.Fingerprint() == "" || a.Fingerprint() != b.Fingerprint() {
+		t.Fatalf("stable fingerprint = %q / %q", a.Fingerprint(), b.Fingerprint())
+	}
+	changed, err := Parse([]byte(`{"source":"test","fetched_at":"different","models":{"m":{"input":1,"output":1}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Fingerprint() == a.Fingerprint() {
+		t.Error("different snapshot has the same fingerprint")
+	}
+}
+
 func TestCandidatesOrder(t *testing.T) {
 	got := Candidates("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
 	want := []string{
@@ -86,6 +129,75 @@ func TestCandidatesOrder(t *testing.T) {
 	}
 }
 
+func TestTierSelection(t *testing.T) {
+	baseInput, tierInput, tierOutput := 1.0, 2.0, 3.0
+	rate := Rate{Input: baseInput, Output: 1, Tiers: []Tier{{
+		AboveInputTokens: 200_000, Input: &tierInput, Output: &tierOutput,
+	}}}
+	if got, threshold := rate.ForInput(200_000); got.Input != 1 || threshold != 0 {
+		t.Errorf("boundary rate = %+v at %d", got, threshold)
+	}
+	if got, threshold := rate.ForInput(200_001); got.Input != 2 || got.Output != 3 || threshold != 200_000 {
+		t.Errorf("tier rate = %+v at %d", got, threshold)
+	}
+}
+
+func TestEffectiveDatedCardsAndCoverageGaps(t *testing.T) {
+	tbl, err := Parse([]byte(`{
+		"source":"current","fetched_at":"2026-08-21T00:00:00Z",
+		"models":{"model":{"input":9,"output":9}},
+		"history":{"model":[
+			{"effective_from":"2025-01-01","effective_to":"2026-01-01","source":"vendor-2025","rate":{"input":1,"output":2}},
+			{"effective_from":"2026-02-01","effective_to":"2027-01-01","source":"vendor-2026","rate":{"input":3,"output":4}}
+		]}}
+	`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(value string) time.Time {
+		parsed, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parsed
+	}
+	if rate, resolution, ok := tbl.ResolveAt("model", at("2025-06-01"), 1); !ok || rate.Input != 1 || resolution.Source != "vendor-2025" {
+		t.Errorf("2025 resolution = %+v, %+v, %v", rate, resolution, ok)
+	}
+	if _, resolution, ok := tbl.ResolveAt("model", at("2026-01-15"), 1); ok || resolution.Key != "model" {
+		t.Errorf("coverage gap unexpectedly resolved: %+v, %v", resolution, ok)
+	}
+	if rate, resolution, ok := tbl.ResolveAt("model", time.Time{}, 1); !ok || rate.Input != 9 || resolution.EffectiveFrom != "" {
+		t.Errorf("undated current resolution = %+v, %+v, %v", rate, resolution, ok)
+	}
+}
+
+func TestHistoryNormalizationAndTierInheritance(t *testing.T) {
+	tbl, err := Parse([]byte(`{
+		"source":"test","fetched_at":"2026-08-21T00:00:00Z",
+		"models":{
+			"vertex_ai/model":{"input":9,"output":9,"tiers":[{"above_input_tokens":100,"input":4}]},
+			"model":{"input":8,"output":8}
+		},
+		"history":{"model":[{"effective_from":"2026-01-01","rate":{"input":1,"output":2}}]}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at, _ := time.Parse("2006-01-02", "2026-06-01")
+	rate, resolution, ok := tbl.ResolveAt("vertex_ai/model", at, 101)
+	if !ok || resolution.Key != "model" || resolution.EffectiveFrom != "2026-01-01" {
+		t.Fatalf("prefixed historical resolution = %+v, %v", resolution, ok)
+	}
+	if rate.Input != 4 {
+		t.Errorf("historical card did not inherit current tiers: input = %v, want 4", rate.Input)
+	}
+	before, _ := time.Parse("2006-01-02", "2025-12-31")
+	if _, resolution, ok := tbl.ResolveAt("vertex_ai/model", before, 1); ok || resolution.Key != "model" {
+		t.Errorf("prefixed coverage gap unexpectedly resolved: %+v, %v", resolution, ok)
+	}
+}
+
 func TestEmbeddedSnapshot(t *testing.T) {
 	tbl, err := Embedded()
 	if err != nil {
@@ -96,6 +208,30 @@ func TestEmbeddedSnapshot(t *testing.T) {
 	}
 	if tbl.Source == "" || tbl.FetchedAt == "" {
 		t.Error("embedded snapshot missing provenance")
+	}
+	var tiered int
+	for _, rate := range tbl.rates {
+		if len(rate.Tiers) > 0 {
+			tiered++
+		}
+	}
+	if tiered == 0 {
+		t.Error("embedded snapshot contains no long-context tiers")
+	}
+	beforeLaunch, _ := time.Parse("2006-01-02", "2026-06-29")
+	if _, resolution, ok := tbl.ResolveAt("claude-sonnet-5", beforeLaunch, 1); ok || resolution.Key != "claude-sonnet-5" {
+		t.Errorf("pre-launch Sonnet 5 unexpectedly priced: %+v, %v", resolution, ok)
+	}
+	launch, _ := time.Parse("2006-01-02", "2026-06-30")
+	if rate, resolution, ok := tbl.ResolveAt("claude-sonnet-5", launch, 1); !ok || rate.Input != 2e-6 || resolution.EffectiveFrom != "2026-06-30" {
+		t.Errorf("launch Sonnet 5 card = %+v, %+v, %v", rate, resolution, ok)
+	}
+	// Anthropic made the launch price permanent on 2026-08-10; the planned
+	// September increase was cancelled. Pin a post-September request so a
+	// future edit cannot resurrect that obsolete transition.
+	postSeptember, _ := time.Parse("2006-01-02", "2026-09-01")
+	if rate, resolution, ok := tbl.ResolveAt("vertex_ai/claude-sonnet-5", postSeptember, 1); !ok || rate.Input != 2e-6 || rate.Output != 10e-6 || resolution.EffectiveTo != "" {
+		t.Errorf("permanent Sonnet 5 card = %+v, %+v, %v", rate, resolution, ok)
 	}
 	// A long-stable key that should survive snapshot refreshes.
 	rate, ok := tbl.Lookup("claude-3-opus-20240229")
@@ -124,7 +260,7 @@ func TestBlankModelIsUnpricedNotFatal(t *testing.T) {
 		if ok {
 			t.Errorf("Lookup(%q) reported priced (%+v), want unpriced", model, rate)
 		}
-		if rate != (Rate{}) {
+		if !reflect.DeepEqual(rate, Rate{}) {
 			t.Errorf("Lookup(%q) rate = %+v, want zero value", model, rate)
 		}
 	}

@@ -11,6 +11,7 @@ package claude
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -22,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +47,15 @@ func New() *Adapter { return &Adapter{} }
 
 // Slug implements agent.Adapter.
 func (*Adapter) Slug() canon.AgentSlug { return Slug }
+
+// ParseVersion forces a full reparse after the adapter learns metadata or
+// normalization that cannot be recovered from an append-only tail (v4:
+// thinking text and image locators; v5: legacy subagent files' parent link;
+// v6: continued-session and fork-point lineage; v7: error, abort and
+// denial events; v8: pull-request links; v9: turn and tool timing;
+// v10: compactions; v11: hook runs; v12: file change line counts;
+// v13: per-turn effort; v14: meta lines never title a session).
+func (*Adapter) ParseVersion() int { return 14 }
 
 // RootSpec implements agent.Adapter: Claude Code relocates its data dir
 // via CLAUDE_CONFIG_DIR.
@@ -82,6 +93,10 @@ func (*Adapter) Discover(ctx context.Context, root agent.Root) ([]agent.SourceRe
 			continue // unreadable project dir: surfaced later as a diagnostic by the pipeline
 		}
 		for _, f := range files {
+			if f.IsDir() && sessionUUIDRe.MatchString(f.Name()) {
+				refs = append(refs, discoverSubagents(root, filepath.Join(projectsDir, dir.Name(), f.Name()))...)
+				continue
+			}
 			if f.IsDir() || !strings.HasSuffix(f.Name(), ".jsonl") {
 				continue
 			}
@@ -109,8 +124,67 @@ type rawLine struct {
 	Timestamp   time.Time       `json:"timestamp"`
 	RequestID   string          `json:"requestId"`
 	CostUSD     *float64        `json:"costUSD"` // pre-v1.0.9 Claude Code
+	CustomTitle string          `json:"customTitle"`
+	AITitle     string          `json:"aiTitle"`
 	Content     json.RawMessage `json:"content"` // system lines
 	Message     json.RawMessage `json:"message"`
+
+	// type == "fork-context-ref": the parent entry a forked agent's
+	// context ends at.
+	ParentLastUUID string `json:"parentLastUuid"`
+
+	// Failed model requests are written as synthetic assistant lines.
+	IsAPIErrorMessage bool   `json:"isApiErrorMessage"`
+	APIErrorStatus    int    `json:"apiErrorStatus"`
+	Error             string `json:"error"`
+	QuotaLimits       *struct {
+		RateLimitType string `json:"rateLimitType"`
+	} `json:"quotaLimits"`
+	// Set on the tool_result line of a call refused before it ran.
+	ToolDenialKind string `json:"toolDenialKind"`
+
+	// type == "system", subtype == "turn_duration": one turn's wall time.
+	Subtype      string `json:"subtype"`
+	DurationMs   int64  `json:"durationMs"`
+	MessageCount int    `json:"messageCount"`
+
+	// type == "system", subtype == "compact_boundary".
+	CompactMetadata *struct {
+		Trigger    string `json:"trigger"`
+		PreTokens  int64  `json:"preTokens"`
+		PostTokens int64  `json:"postTokens"`
+		DurationMs int64  `json:"durationMs"`
+	} `json:"compactMetadata"`
+
+	// type == "attachment": context Claude Code attached to the turn,
+	// including every hook run. Hook stdout/stderr are deliberately not
+	// decoded: they are arbitrary program output.
+	Attachment *struct {
+		Type       string `json:"type"`
+		HookEvent  string `json:"hookEvent"`
+		HookName   string `json:"hookName"`
+		Command    string `json:"command"`
+		ExitCode   *int   `json:"exitCode"`
+		DurationMs int64  `json:"durationMs"`
+	} `json:"attachment"`
+
+	// Claude Code marks lines it injected itself (local-command caveats,
+	// skill bodies) as meta: transcript provenance, never the user's prompt.
+	IsMeta bool `json:"isMeta"`
+
+	// Assistant lines: the session's effort setting and, when the turn
+	// overrode it, the turn's own.
+	Effort        string `json:"effort"`
+	PerTurnEffort string `json:"perTurnEffort"`
+
+	// The tool result's structured payload, on the line carrying the
+	// tool_result. Decoded only for file changes (see changeLines).
+	ToolUseResult fileChange `json:"toolUseResult"`
+
+	// type == "pr-link": a pull request the session opened or checked.
+	PRNumber     int    `json:"prNumber"`
+	PRURL        string `json:"prUrl"`
+	PRRepository string `json:"prRepository"`
 }
 
 // rawMessage is the Anthropic message payload inside a line.
@@ -128,17 +202,38 @@ type rawUsage struct {
 	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
 	ServiceTier              string `json:"service_tier"`
+	CacheCreation            struct {
+		Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
 }
 
 type contentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Source    *imageSource    `json:"source"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"`
 	IsError   bool            `json:"is_error"`
+}
+
+// imageSource is an image block's payload. Only its shape is decoded here;
+// the base64 data stays in the stored content and is located by pointer.
+type imageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+}
+
+// imageRef locates a base64 image block found at pointer prefix.
+func imageRef(b contentBlock, prefix string) (canon.ImageRef, bool) {
+	if b.Type != "image" || b.Source == nil || b.Source.Type != "base64" {
+		return canon.ImageRef{}, false
+	}
+	return canon.ImageRef{MediaType: b.Source.MediaType, Pointer: prefix + "/source/data"}, true
 }
 
 // Parse dispatches a source by shape: session transcripts here, sidecars
@@ -205,6 +300,7 @@ func (a *Adapter) parseSession(ctx context.Context, src agent.SourceRef, state a
 		ExternalID: sessionID,
 		SourcePath: src.Path,
 	}
+	sub, isSubagent := subagentOf(src.Root, src.Path)
 
 	// Records stream to the sink as they parse — memory stays bounded by
 	// one line, not the session. The session is emitted before its first
@@ -214,15 +310,80 @@ func (a *Adapter) parseSession(ctx context.Context, src agent.SourceRef, state a
 	// instead of an in-memory index, the same mechanism late results
 	// already used.
 	emittedSession := false
-	warnedIDMismatch := false
+	// Lines carrying ANOTHER session's id are history copied in when that
+	// session was resumed under a new id; a chain of resumes copies every
+	// ancestor's lines, oldest first, so the last foreign id seen is the
+	// direct parent and its last copied entry is where this one branched.
+	var (
+		copiedFrom, branchUUID string
+		copiedEntries          int
+		firstForeignID         string
+		firstForeignLine       int
+		sawOwnID               bool
+	)
+	// Metadata lines (pull-request links) can precede the first message,
+	// when the session row does not exist yet; their events wait here.
+	var pendingEvents []canon.SessionEvent
+	flushEvents := func() error {
+		for _, ev := range pendingEvents {
+			if err := sink.SessionEvent(ev); err != nil {
+				return err
+			}
+		}
+		pendingEvents = nil
+		return nil
+	}
 	emitSession := func() error {
 		if emittedSession {
 			return nil
 		}
 		emittedSession = true
-		return sink.Session(sess)
+		if err := sink.Session(sess); err != nil {
+			return err
+		}
+		if err := flushEvents(); err != nil {
+			return err
+		}
+		if !isSubagent || sub.parent() == "" {
+			return nil
+		}
+		return sink.SessionRelation(canon.SessionRelation{
+			Agent:          Slug,
+			FromExternalID: sess.ExternalID,
+			ToExternalID:   sub.parent(),
+			Kind:           canon.RelSubagentOf,
+			Evidence:       sub.evidence(),
+		})
 	}
 	messageCount, toolCount := 0, 0
+	// queueEvent anchors a metadata event after the last message so far.
+	queueEvent := func(ev canon.SessionEvent) error {
+		ev.SessionExternalID = sess.ExternalID
+		ev.MessageSeq = max(state.MessageSeq+messageCount-1, 0)
+		pendingEvents = append(pendingEvents, ev)
+		if !emittedSession {
+			return nil
+		}
+		return flushEvents()
+	}
+	metadataChanged := false
+	var seenPRs map[string]bool
+	titlePriority := 0 // first prompt < AI title < user-assigned custom title
+	setTitle := func(title string, priority int, override bool) bool {
+		title = strings.TrimSpace(title)
+		if title == "" || priority < titlePriority {
+			return false
+		}
+		sess.Title = canon.TruncateBytes(title, canon.SessionTitleLimit)
+		sess.TitleOverride = sess.TitleOverride || override
+		titlePriority = priority
+		return true
+	}
+	if isSubagent {
+		// The spawning call's description names the task better than the
+		// prompt, which is usually a long instruction block.
+		setTitle(sub.meta.Description, 2, false)
+	}
 
 	offset := state.Offset
 	lineNo := state.LineNo
@@ -300,6 +461,53 @@ func (a *Adapter) parseSession(ctx context.Context, src agent.SourceRef, state a
 			continue
 		}
 		switch entry.Type {
+		case "attachment":
+			if ev, ok := hookEvent(entry); ok {
+				if err := queueEvent(ev); err != nil {
+					return state, err
+				}
+			}
+			continue
+		case "pr-link":
+			// Claude Code rewrites the link every time it checks the PR —
+			// up to 162 lines for one PR in one session locally — so one
+			// event per URL per parse.
+			if entry.PRURL == "" || seenPRs[entry.PRURL] {
+				continue
+			}
+			if seenPRs == nil {
+				seenPRs = map[string]bool{}
+			}
+			seenPRs[entry.PRURL] = true
+			payload, _ := json.Marshal(map[string]any{
+				"number": entry.PRNumber, "url": entry.PRURL, "repository": entry.PRRepository,
+			})
+			if err := queueEvent(canon.SessionEvent{
+				Kind:    canon.EventPRLink,
+				At:      entry.Timestamp,
+				Label:   entry.PRRepository,
+				Detail:  entry.PRURL,
+				Payload: payload,
+			}); err != nil {
+				return state, err
+			}
+			continue
+		case "custom-title":
+			// Claude's /rename metadata is authoritative and can arrive in a
+			// later tail after the fallback prompt was already stored.
+			metadataChanged = setTitle(entry.CustomTitle, 3, true) || metadataChanged
+			continue
+		case "ai-title":
+			// AI titles improve a full parse and can fill an otherwise untitled
+			// session. They are not explicit renames, so AdvanceSession will not
+			// replace a title already chosen by the user or an earlier prompt.
+			metadataChanged = setTitle(entry.AITitle, 2, false) || metadataChanged
+			continue
+		case "fork-context-ref":
+			if isSubagent {
+				sub.branchUUID = entry.ParentLastUUID
+			}
+			continue
 		case "user", "assistant", "system":
 		default:
 			continue // progress lines and future types are not transcript entries
@@ -308,23 +516,46 @@ func (a *Adapter) parseSession(ctx context.Context, src agent.SourceRef, state a
 		// before a single line parses, so children can be emitted from the
 		// first entry onward. The sessionId inside the JSONL is therefore
 		// never a fallback — it used to be guarded by an ExternalID == ""
-		// test that could not fire. A disagreement is worth saying out
-		// loud though: it means the transcript was copied or renamed, and
-		// it will index under a different id than the agent recorded.
-		if entry.SessionID != "" && entry.SessionID != sessionID && !warnedIDMismatch {
-			warnedIDMismatch = true
-			if serr := sink.Issue(canon.Issue{
-				Agent: Slug, Severity: canon.SeverityWarn, Category: "identity",
-				SourcePath: src.Path, Line: lineNo,
-				Detail: fmt.Sprintf("entry sessionId %q differs from the file name %q; indexing under the file name",
-					entry.SessionID, sessionID),
-			}); serr != nil {
-				return state, serr
+		// test that could not fire. A disagreement is copied history (see
+		// copiedFrom); a file made ONLY of other sessions' lines is a copy or
+		// rename, which is worth saying out loud once parsing ends.
+		// A subagent's lines carry its PARENT's sessionId by design; for the
+		// legacy layout that sessionId is the only record of the parent.
+		if isSubagent && sub.legacy && sub.parentSession == "" {
+			sub.parentSession = entry.SessionID
+		}
+		expectedID := sessionID
+		if isSubagent {
+			expectedID = sub.parentSession
+		}
+		switch {
+		case entry.SessionID == "":
+		case isSubagent:
+			// A subagent's lines name its parent, which can itself be
+			// resumed under a new id while the agent runs; that is not
+			// copied history.
+		case entry.SessionID == expectedID:
+			sawOwnID = true
+		default:
+			if firstForeignID == "" {
+				firstForeignID, firstForeignLine = entry.SessionID, lineNo
 			}
+			copiedFrom, branchUUID = entry.SessionID, entry.UUID
+			copiedEntries++
 		}
 
 		msg, calls, results := a.convertLine(entry, state.MessageSeq+messageCount, sessionID)
-		a.foldSession(&sess, entry, msg)
+		if isSubagent {
+			// Every line of a subagent file is flagged as a sidechain of the
+			// parent; in its own session it is the main line.
+			msg.IsSidechain = false
+		}
+		a.foldSession(&sess, entry)
+		if titlePriority < 1 && msg.Role == canon.RoleUser && !msg.IsSidechain && !entry.IsMeta {
+			if title := claudePromptTitle(msg.Text); title != "" {
+				setTitle(title, 1, false)
+			}
+		}
 		if err := emitSession(); err != nil {
 			return state, err
 		}
@@ -347,6 +578,11 @@ func (a *Adapter) parseSession(ctx context.Context, src agent.SourceRef, state a
 		if err := sink.Message(msg); err != nil {
 			return state, err
 		}
+		if ev, ok := lineEvent(entry, msg, results); ok {
+			if err := sink.SessionEvent(ev); err != nil {
+				return state, err
+			}
+		}
 		messageCount++
 	}
 
@@ -357,15 +593,50 @@ func (a *Adapter) parseSession(ctx context.Context, src agent.SourceRef, state a
 		ToolSeq:    state.ToolSeq + toolCount,
 		LineNo:     lineNo,
 	}
-	if messageCount == 0 {
+	if len(pendingEvents) > 0 {
+		metadataChanged = true
+	}
+	if messageCount == 0 && (!metadataChanged || !resuming) {
 		// Not a transcript (or nothing new): nothing was emitted, and the
-		// cursor still advances past what was read.
+		// cursor still advances past what was read. A metadata-only initial
+		// file also waits for its first message; the later tail will fall back
+		// to a full parse because no session row exists yet, preserving its
+		// creation attributes. Metadata-only tails of existing sessions do
+		// emit below so a rename takes effect immediately.
 		return newState, nil
+	}
+
+	if copiedFrom != "" {
+		evidence, _ := json.Marshal(map[string]any{
+			"source": "copied-history", "branchUuid": branchUUID, "copiedEntries": copiedEntries,
+		})
+		if err := sink.SessionRelation(canon.SessionRelation{
+			Agent:          Slug,
+			FromExternalID: sess.ExternalID,
+			ToExternalID:   copiedFrom,
+			Kind:           canon.RelResumedFrom,
+			Evidence:       evidence,
+		}); err != nil {
+			return state, err
+		}
+	}
+	if firstForeignID != "" && !sawOwnID {
+		if err := sink.Issue(canon.Issue{
+			Agent: Slug, Severity: canon.SeverityWarn, Category: "identity",
+			SourcePath: src.Path, Line: firstForeignLine,
+			Detail: fmt.Sprintf("entry sessionId %q differs from the file name %q; indexing under the file name",
+				firstForeignID, sessionID),
+		}); err != nil {
+			return state, err
+		}
 	}
 
 	// Final emit: the folded metadata (title, created/modified, cwd,
 	// branch) accumulated over everything read.
 	if err := sink.Session(sess); err != nil {
+		return state, err
+	}
+	if err := flushEvents(); err != nil {
 		return state, err
 	}
 	return newState, nil
@@ -434,12 +705,16 @@ func drainLine(r *bufio.Reader, w io.Writer) (n int64, terminated bool, err erro
 // of overlapping bytes, on every line of every transcript, which is the
 // hottest path in the whole indexer.
 func (a *Adapter) convertLine(raw rawLine, seq int, sessionID string) (canon.Message, []canon.ToolCall, []canon.ToolResult) {
+	kind := canon.KindMessage
+	if raw.Subtype == "compact_boundary" {
+		kind = canon.KindCompaction
+	}
 	msg := canon.Message{
+		Kind:             kind,
 		Seq:              seq,
 		ExternalID:       raw.UUID,
 		ParentExternalID: raw.ParentUUID,
 		Role:             canon.Role(raw.Type),
-		Kind:             canon.KindMessage,
 		CreatedAt:        raw.Timestamp,
 		CWD:              raw.CWD,
 		IsSidechain:      raw.IsSidechain,
@@ -458,13 +733,21 @@ func (a *Adapter) convertLine(raw rawLine, seq int, sessionID string) (canon.Mes
 			msg.Model = payload.Model
 			if payload.Usage != nil {
 				msg.Usage = &canon.Usage{
-					InputTokens:      payload.Usage.InputTokens,
-					OutputTokens:     payload.Usage.OutputTokens,
-					CacheReadTokens:  payload.Usage.CacheReadInputTokens,
-					CacheWriteTokens: payload.Usage.CacheCreationInputTokens,
-					ServiceTier:      payload.Usage.ServiceTier,
-					ReportedCostUSD:  raw.CostUSD,
-					RequestID:        raw.RequestID,
+					InputTokens:        payload.Usage.InputTokens,
+					OutputTokens:       payload.Usage.OutputTokens,
+					CacheReadTokens:    payload.Usage.CacheReadInputTokens,
+					CacheWriteTokens:   payload.Usage.CacheCreationInputTokens,
+					CacheWrite1hTokens: payload.Usage.CacheCreation.Ephemeral1hInputTokens,
+					ServiceTier:        payload.Usage.ServiceTier,
+					ReportedCostUSD:    raw.CostUSD,
+					RequestID:          raw.RequestID,
+				}
+			} else if raw.CostUSD != nil {
+				// Legacy Claude lines can carry a complete reported cost without
+				// message.usage. Preserve the cost as a zero-token usage record.
+				msg.Usage = &canon.Usage{
+					ReportedCostUSD: raw.CostUSD,
+					RequestID:       raw.RequestID,
 				}
 			}
 		}
@@ -480,6 +763,31 @@ func (a *Adapter) convertLine(raw rawLine, seq int, sessionID string) (canon.Mes
 
 	content := blocks(payload.Content)
 	msg.Text = extractText(payload.Content, content, raw.Content)
+	var thinking []string
+	for i, block := range content {
+		prefix := "/content/" + strconv.Itoa(i)
+		switch block.Type {
+		case "thinking":
+			thinking = append(thinking, block.Thinking)
+		case "image":
+			if ref, ok := imageRef(block, prefix); ok {
+				msg.Images = append(msg.Images, ref)
+			}
+		case "tool_result":
+			// Screenshots come back inside tool results. The nested array
+			// is decoded only when it can hold an image at all: this runs
+			// on every tool result of every transcript.
+			if !bytes.Contains(block.Content, []byte(`"image"`)) {
+				continue
+			}
+			for j, inner := range blocks(block.Content) {
+				if ref, ok := imageRef(inner, prefix+"/content/"+strconv.Itoa(j)); ok {
+					msg.Images = append(msg.Images, ref)
+				}
+			}
+		}
+	}
+	msg.Thinking = canon.JoinThinking(thinking)
 
 	var (
 		calls   []canon.ToolCall
@@ -519,16 +827,151 @@ func (a *Adapter) convertLine(raw rawLine, seq int, sessionID string) (canon.Mes
 				CallExternalID:    block.ToolUseID,
 				Status:            status,
 				Excerpt:           excerpt(block.Content),
+				At:                raw.Timestamp,
 			})
 		}
+	}
+	if msg.Role == canon.RoleAssistant {
+		msg.Effort = cmp.Or(raw.PerTurnEffort, raw.Effort)
+	}
+	// One tool result per line is the norm; the line-level payload belongs
+	// to it. With several, which one it describes is unknowable.
+	if len(results) == 1 {
+		results[0].Lines = raw.ToolUseResult.lines
 	}
 	return msg, calls, results
 }
 
+// fileChange is a line's toolUseResult reduced to its file-change size
+// while the line decodes, so a large result (a whole file read back) is
+// never copied out of the line.
+type fileChange struct{ lines *canon.LineCounts }
+
+func (f *fileChange) UnmarshalJSON(raw []byte) error {
+	f.lines = changeLines(raw)
+	return nil
+}
+
+// changeLines sizes a file change from its tool result: a new file by its
+// content, an edit or overwrite by its structured patch. Anything else
+// (reads, shell output, errors written as a bare string) is not a change.
+func changeLines(raw []byte) *canon.LineCounts {
+	if jsonl.FirstByte(raw) != '{' || !bytes.Contains(raw, []byte(`"structuredPatch"`)) {
+		return nil
+	}
+	var r struct {
+		Type            string `json:"type"`
+		Content         string `json:"content"`
+		StructuredPatch []struct {
+			Lines []string `json:"lines"`
+		} `json:"structuredPatch"`
+	}
+	if json.Unmarshal(raw, &r) != nil {
+		return nil
+	}
+	if r.Type == "create" {
+		return &canon.LineCounts{Added: canon.CountTextLines(r.Content)}
+	}
+	var lines []string
+	for _, h := range r.StructuredPatch {
+		lines = append(lines, h.Lines...)
+	}
+	c := canon.CountDiffLines(lines)
+	return &c
+}
+
+// hookEvent reads a hook run from an attachment line: completed runs
+// (synchronous or async) and runs that blocked the agent. Hook context
+// attachments repeat a run already recorded and are skipped.
+func hookEvent(raw rawLine) (canon.SessionEvent, bool) {
+	a := raw.Attachment
+	if a == nil {
+		return canon.SessionEvent{}, false
+	}
+	ev := canon.SessionEvent{
+		Kind:  canon.EventHook,
+		At:    raw.Timestamp,
+		Label: a.HookEvent,
+		// Async responses name the hook but not its command.
+		Detail:     cmp.Or(a.Command, a.HookName),
+		DurationMs: a.DurationMs,
+	}
+	payload := map[string]any{"hookName": a.HookName}
+	switch a.Type {
+	case "hook_success", "async_hook_response":
+		ev.Status = "ok"
+		if a.ExitCode != nil {
+			payload["exitCode"] = *a.ExitCode
+			if *a.ExitCode != 0 {
+				ev.Status = "error"
+			}
+		}
+	case "hook_blocking_error":
+		ev.Status = "blocked"
+	default:
+		return canon.SessionEvent{}, false
+	}
+	ev.Payload, _ = json.Marshal(payload)
+	return ev, true
+}
+
+// interruptMarker opens the user line Claude Code writes when a turn is
+// cut short ("… by user]" or "… by user for tool use]").
+const interruptMarker = "[Request interrupted by user"
+
+// lineEvent derives the session event a line records, if any: a failed
+// model request, an interrupted turn, a refused tool call, or a finished
+// turn's duration.
+func lineEvent(raw rawLine, msg canon.Message, results []canon.ToolResult) (canon.SessionEvent, bool) {
+	ev := canon.SessionEvent{
+		SessionExternalID: msg.SessionExternalID,
+		MessageSeq:        msg.Seq,
+		At:                raw.Timestamp,
+	}
+	switch {
+	case raw.IsAPIErrorMessage:
+		ev.Kind = canon.EventAPIError
+		ev.Label = cmp.Or(raw.Error, "error")
+		if raw.APIErrorStatus != 0 {
+			ev.Status = fmt.Sprint(raw.APIErrorStatus)
+		}
+		ev.Detail = strings.TrimSpace(msg.Text)
+		if raw.QuotaLimits != nil && raw.QuotaLimits.RateLimitType != "" {
+			ev.Payload, _ = json.Marshal(map[string]string{"rateLimitType": raw.QuotaLimits.RateLimitType})
+		}
+	case raw.ToolDenialKind != "":
+		ev.Kind = canon.EventToolDenied
+		ev.Label = raw.ToolDenialKind
+		if len(results) > 0 {
+			ev.Detail = results[0].Excerpt
+			ev.Payload, _ = json.Marshal(map[string]string{"toolUseId": results[0].CallExternalID})
+		}
+	case raw.Type == "system" && raw.Subtype == "compact_boundary" && raw.CompactMetadata != nil:
+		cm := raw.CompactMetadata
+		ev.Kind = canon.EventCompaction
+		ev.Label = cm.Trigger
+		ev.DurationMs = cm.DurationMs
+		ev.Detail = canon.CompactionDetail(cm.PreTokens, cm.PostTokens)
+		ev.Payload, _ = json.Marshal(map[string]int64{"preTokens": cm.PreTokens, "postTokens": cm.PostTokens})
+	case raw.Type == "system" && raw.Subtype == "turn_duration" && raw.DurationMs > 0:
+		ev.Kind = canon.EventTurn
+		ev.DurationMs = raw.DurationMs
+		ev.Payload, _ = json.Marshal(map[string]int{"messageCount": raw.MessageCount})
+	case msg.Role == canon.RoleUser && strings.HasPrefix(strings.TrimSpace(msg.Text), interruptMarker):
+		ev.Kind = canon.EventAborted
+		ev.Label = "user"
+		ev.Detail = strings.TrimSpace(msg.Text)
+	default:
+		return canon.SessionEvent{}, false
+	}
+	return ev, true
+}
+
 // foldSession accumulates session attributes from entries: first
-// timestamp/cwd/branch wins for creation state, last timestamp wins for
-// modification, title comes from the first non-sidechain user text.
-func (a *Adapter) foldSession(sess *canon.Session, raw rawLine, msg canon.Message) {
+// timestamp/cwd wins for creation state, while the last timestamp and branch
+// win for the current state. Title selection is handled by parseSession so
+// native title metadata can outrank fallback prompt text.
+func (a *Adapter) foldSession(sess *canon.Session, raw rawLine) {
 	if sess.CreatedAt.IsZero() && !raw.Timestamp.IsZero() {
 		sess.CreatedAt = raw.Timestamp
 	}
@@ -541,9 +984,30 @@ func (a *Adapter) foldSession(sess *canon.Session, raw rawLine, msg canon.Messag
 	if raw.GitBranch != "" {
 		sess.GitBranch = raw.GitBranch
 	}
-	if sess.Title == "" && msg.Role == canon.RoleUser && !msg.IsSidechain && msg.Text != "" {
-		sess.Title = canon.TruncateBytes(strings.TrimSpace(msg.Text), canon.SessionTitleLimit)
+}
+
+// claudePromptTitle rejects Claude's synthetic user-role control messages.
+// They are useful transcript provenance, but a local-command caveat or slash
+// command envelope says nothing about the session's purpose. Returning empty
+// lets the next real user prompt become the fallback title.
+func claudePromptTitle(text string) string {
+	title := strings.TrimSpace(text)
+	for _, prefix := range []string{
+		"<local-command-caveat>",
+		"<command-name>",
+		"<command-message>",
+		"<command-args>",
+		"<local-command-stdout>",
+		"<bash-input>",
+		"<bash-stdout>",
+		"<bash-stderr>",
+		"<system-reminder>",
+	} {
+		if strings.HasPrefix(title, prefix) {
+			return ""
+		}
 	}
+	return title
 }
 
 // blocks decodes a message's content array. Claude writes a bare STRING

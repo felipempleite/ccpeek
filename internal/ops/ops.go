@@ -46,7 +46,8 @@ type Param struct {
 	// ErrBadRequest, never a silent truncation — and both numbers come
 	// from the same query.Limit, so what a transport advertises is what
 	// the read applies.
-	Max int
+	Max  int
+	Enum []string // Optional JSON-Schema enum for string parameters.
 }
 
 // Args carries decoded inputs for an executor.
@@ -109,8 +110,15 @@ func Registry() []Op {
 	agentParam := Param{Name: "agent", Type: "string", Desc: "Filter by agent slug (claude-code, pi, codex, opencode, cursor)"}
 	sinceParam := Param{Name: "since", Type: "string", Desc: "Inclusive YYYY-MM-DD lower bound"}
 	untilParam := Param{Name: "until", Type: "string", Desc: "Inclusive YYYY-MM-DD upper bound"}
-
 	return []Op{
+		{
+			Name: "archive-status",
+			Desc: "Report archive generation, pending derived repairs, imported history, last index outcome and stored-content secret scan coverage.",
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.ArchiveStatus(ctx)
+				return out, false, err
+			},
+		},
 		{
 			Name: "sessions",
 			Desc: "List coding-agent sessions, newest first. Filter by agent slug, project path, model, date range (YYYY-MM-DD), or title substring. Returns tokens and estimated cost per session.",
@@ -120,6 +128,7 @@ func Registry() []Op {
 				{Name: "model", Type: "string", Desc: "Filter to sessions that used a model"},
 				sinceParam, untilParam,
 				{Name: "query", Type: "string", Desc: "Substring filter on session title", CLIFlag: "title"},
+				{Name: "subagents", Type: "boolean", Desc: "Include subagent sessions (hidden by default; a parent's `session` lists its own)"},
 				limitParam("Maximum results", query.SessionsLimit),
 				{Name: "offset", Type: "integer", Desc: "Pagination offset"},
 			},
@@ -128,14 +137,15 @@ func Registry() []Op {
 					Agent: a.Str["agent"], Project: a.Str["project"],
 					Model: a.Str["model"], Since: a.Str["since"],
 					Until: a.Str["until"], Query: a.Str["query"],
-					Limit: a.Int["limit"], Offset: a.Int["offset"],
+					Subagents: a.Bool["subagents"],
+					Limit:     a.Int["limit"], Offset: a.Int["offset"],
 				})
 				return out, len(out) == 0, err
 			},
 		},
 		{
 			Name: "session",
-			Desc: "Get one session with everything related to it: token/cost totals, models used, relations (forks, resumes, sidechains), and linked artifacts.",
+			Desc: "Get one session with everything related to it: token/cost totals, models used, relations (forks, resumes, sidechains), linked artifacts, and the subagents it spawned with their combined cost.",
 			Params: []Param{
 				{Name: "agent", Type: "string", Desc: "Agent slug", Required: true, Positional: true},
 				{Name: "id", Type: "string", Desc: "Session id", Required: true, Positional: true},
@@ -154,10 +164,12 @@ func Registry() []Op {
 				{Name: "from_seq", Type: "integer", Desc: "Start at this entry seq"},
 				limitParam("Maximum entries", query.TranscriptLimit),
 				{Name: "full", Type: "boolean", Desc: "Include raw agent payloads"},
+				{Name: "thinking", Type: "boolean", Desc: "Include the model's reasoning text where the agent recorded it"},
 			},
 			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
 				out, err := svc.Transcript(ctx, a.Str["agent"], a.Str["id"], query.TranscriptOptions{
 					FromSeq: a.Int["from_seq"], Limit: a.Int["limit"], Full: a.Bool["full"],
+					Thinking: a.Bool["thinking"],
 				})
 				return out, len(out) == 0, err
 			},
@@ -182,6 +194,19 @@ func Registry() []Op {
 					Until: a.Str["until"], Limit: a.Int["limit"],
 				})
 				return out, len(out) == 0, err
+			},
+		},
+		{
+			Name: "pricing",
+			Desc: "Explain the embedded pricing snapshot and optionally resolve one provider/model key, including missing cache-rate dimensions.",
+			Params: []Param{
+				{Name: "model", Type: "string", Desc: "Optional model or provider/model identifier to resolve"},
+				{Name: "at", Type: "string", Desc: "Request time as RFC3339 or YYYY-MM-DD for historical pricing"},
+				{Name: "input_tokens", Type: "integer", Desc: "Total request input tokens for long-context tier selection"},
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.PricingAt(ctx, a.Str["model"], a.Str["at"], int64(a.Int["input_tokens"]))
+				return out, false, err
 			},
 		},
 		{
@@ -238,10 +263,9 @@ func Registry() []Op {
 			},
 		},
 		{
-			Name:   "stats",
-			Desc:   "Overview counters: sessions, messages, tool calls, artifacts, active scan findings, tokens, and cost, with per-agent and per-day activity.",
-			Params: nil,
-			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+			Name: "stats",
+			Desc: "Overview counters: sessions, messages, tool calls, artifacts, active scan findings, tokens, and cost, with per-agent and per-day activity.",
+			Run: func(ctx context.Context, svc *query.Service, _ Args) (any, bool, error) {
 				out, err := svc.Stats(ctx)
 				return out, false, err
 			},
@@ -333,6 +357,128 @@ func Registry() []Op {
 					Limit: a.Int["limit"], Offset: a.Int["offset"],
 					FromSeq: a.Int["from_seq"], ToSeq: a.Int["to_seq"],
 					Compact: a.Bool["compact"],
+				})
+				return out, len(out) == 0, err
+			},
+		},
+		{
+			Name: "changes",
+			Desc: "File churn — lines added and removed by agents' edits and writes — grouped by day, agent, or file (the most-changed files). Covers changes whose size the agent recorded.",
+			Params: []Param{
+				{
+					Name: "group", Type: "string", Default: "day",
+					Desc: "Group by: day | agent | file (default day)",
+					Enum: []string{"day", "agent", "file"},
+				},
+				agentParam,
+				sinceParam, untilParam,
+				limitParam("Maximum groups", query.ChangesLimit),
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.Changes(ctx, query.ChangesFilter{
+					GroupBy: a.Str["group"], Agent: a.Str["agent"],
+					Since: a.Str["since"], Until: a.Str["until"], Limit: a.Int["limit"],
+				})
+				return out, len(out) == 0, err
+			},
+		},
+		{
+			Name: "effort",
+			Desc: "Model requests, tokens and cost split by the reasoning effort or thinking level they ran at (Claude effort, Pi thinking level, Codex effort), per agent or per day. Level is empty where the agent recorded none.",
+			Params: []Param{
+				{
+					Name: "group", Type: "string", Default: "level",
+					Desc: "Group by: level (per agent) | day (default level)",
+					Enum: []string{"level", "day"},
+				},
+				agentParam,
+				sinceParam, untilParam,
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.Effort(ctx, query.EffortFilter{
+					GroupBy: a.Str["group"], Agent: a.Str["agent"],
+					Since: a.Str["since"], Until: a.Str["until"],
+				})
+				return out, len(out) == 0, err
+			},
+		},
+		{
+			Name: "context",
+			Desc: "One session's context fill: prompt tokens (input plus cache reads and writes) per model request in order, with the compactions that emptied it.",
+			Params: []Param{
+				{Name: "agent", Type: "string", Desc: "Agent slug", Required: true, Positional: true},
+				{Name: "id", Type: "string", Desc: "Session id", Required: true, Positional: true},
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.Context(ctx, a.Str["agent"], a.Str["id"])
+				return out, out == nil || len(out.Points) == 0, err
+			},
+		},
+		{
+			Name: "session-events",
+			Desc: "List session events newest first — API errors, aborted turns, refused tool calls, pull requests — each linked to its session and transcript seq. Filter by kind (comma-separated), agent, one session, or date range.",
+			Params: []Param{
+				{Name: "kind", Type: "string", Desc: "Comma-separated event kinds (" + query.EventKindList() + ")"},
+				{Name: "status", Type: "string", Desc: "Comma-separated outcomes (e.g. error,blocked for failing hooks)"},
+				agentParam,
+				{Name: "session", Type: "string", Desc: "One session's external id (needs agent)"},
+				sinceParam, untilParam,
+				{
+					Name: "sort", Type: "string", Default: "time",
+					Desc: "time (newest first) | duration (longest first)",
+					Enum: []string{"time", "duration"},
+				},
+				limitParam("Maximum events", query.EventsLimit),
+				{Name: "offset", Type: "integer", Desc: "Pagination offset"},
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.Events(ctx, query.EventsFilter{
+					Kind: a.Str["kind"], Status: a.Str["status"], Agent: a.Str["agent"], Session: a.Str["session"],
+					Since: a.Str["since"], Until: a.Str["until"], Sort: a.Str["sort"],
+					Limit: a.Int["limit"], Offset: a.Int["offset"],
+				})
+				return out, len(out) == 0, err
+			},
+		},
+		{
+			Name: "event-stats",
+			Desc: "Session events counted by kind and one more dimension (label, status, agent, day, or detail), with failures, distinct sessions and duration totals — e.g. API errors by class, or hook runs per command.",
+			Params: []Param{
+				{Name: "kind", Type: "string", Desc: "Comma-separated event kinds to include"},
+				{
+					Name: "group", Type: "string", Default: "label",
+					Desc: "Second dimension: label | status | agent | day | detail (default label)",
+					Enum: []string{"label", "status", "agent", "day", "detail"},
+				},
+				agentParam,
+				sinceParam, untilParam,
+				limitParam("Maximum groups", query.EventStatsLimit),
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.EventStats(ctx, query.EventStatsFilter{
+					Kind: a.Str["kind"], GroupBy: a.Str["group"], Agent: a.Str["agent"],
+					Since: a.Str["since"], Until: a.Str["until"], Limit: a.Int["limit"],
+				})
+				return out, len(out) == 0, err
+			},
+		},
+		{
+			Name: "tool-stats",
+			Desc: "Tool calls, failed results, and run time per tool across sessions — which tools break, and where the time goes.",
+			Params: []Param{
+				agentParam,
+				sinceParam, untilParam,
+				{
+					Name: "sort", Type: "string", Default: "errors",
+					Desc: "errors (most failures) | total (most time) | avg (slowest on average)",
+					Enum: []string{"errors", "total", "avg"},
+				},
+				limitParam("Maximum tools", query.ToolStatsLimit),
+			},
+			Run: func(ctx context.Context, svc *query.Service, a Args) (any, bool, error) {
+				out, err := svc.ToolStats(ctx, query.ToolStatsFilter{
+					Agent: a.Str["agent"], Since: a.Str["since"], Until: a.Str["until"],
+					Sort: a.Str["sort"], Limit: a.Int["limit"],
 				})
 				return out, len(out) == 0, err
 			},

@@ -3,21 +3,27 @@ package query
 import (
 	"context"
 	"fmt"
+
+	"github.com/ahmedelgabri/ccpeek/internal/pricing"
 )
 
 // UsageRow is one group of the `usage` op, straight from the rollups.
 type UsageRow struct {
-	Group    string      `json:"group"` // day, model, project path, or agent slug
-	Sessions int64       `json:"sessions"`
-	Messages int64       `json:"messages"`
-	Tokens   TokenTotals `json:"tokens"`
-	CostUSD  float64     `json:"costUSD"`
+	Group        string      `json:"group"` // day, model, project path, or agent slug
+	Sessions     int64       `json:"sessions"`
+	Messages     int64       `json:"messages"`
+	Tokens       TokenTotals `json:"tokens"`
+	CostUSD      float64     `json:"costUSD"`
+	CostUSDExact string      `json:"costUSDExact"`
 	// CostUSD = reported (the agent's own figure) + estimated (priced from
 	// tokens) — the closest available proxy for API-billed vs
 	// subscription-covered spend.
-	CostReportedUSD  float64 `json:"costReportedUSD"`
-	CostEstimatedUSD float64 `json:"costEstimatedUSD"`
-	HasUnpriced      bool    `json:"hasUnpriced,omitempty"`
+	CostReportedUSD       float64      `json:"costReportedUSD"`
+	CostReportedUSDExact  string       `json:"costReportedUSDExact"`
+	CostEstimatedUSD      float64      `json:"costEstimatedUSD"`
+	CostEstimatedUSDExact string       `json:"costEstimatedUSDExact"`
+	HasUnpriced           bool         `json:"hasUnpriced,omitempty"`
+	UnpricedTokenTypes    *TokenTotals `json:"unpricedTokenTypes,omitempty"`
 }
 
 // UsageFilter narrows the usage op.
@@ -49,6 +55,10 @@ func (f UsageFilter) group() (groupExpr, orderExpr string, err error) {
 	}
 	return "", "", fmt.Errorf("%w: unknown group %q (want day|model|project|agent)",
 		ErrBadRequest, f.GroupBy)
+}
+
+func tokenTotal(tokens TokenTotals) int64 {
+	return max(tokens.Input, 0) + max(tokens.Output, 0) + max(tokens.CacheRead, 0) + max(tokens.CacheWrite, 0)
 }
 
 // where builds the filter clause both queries run. Same reason as group():
@@ -92,6 +102,9 @@ func (s *Service) Usage(ctx context.Context, f UsageFilter) ([]UsageRow, error) 
 		return nil, err
 	}
 
+	if f.GroupBy != "" && f.GroupBy != "day" {
+		orderExpr = "SUM(r.cost_nanos) DESC"
+	}
 	where, args := f.where()
 	limitClause := ""
 	if f.Limit > 0 {
@@ -104,16 +117,19 @@ func (s *Service) Usage(ctx context.Context, f UsageFilter) ([]UsageRow, error) 
 		       SUM(r.sessions), SUM(r.messages),
 		       SUM(r.input_tokens), SUM(r.output_tokens),
 		       SUM(r.cache_read_tokens), SUM(r.cache_write_tokens),
-		       SUM(r.cost_usd), SUM(r.cost_reported_usd),
-		       SUM(r.cost_estimated_usd),
-		       MIN(r.priced)
+		       SUM(%s), SUM(%s), SUM(%s),
+		       SUM(%s), SUM(%s), SUM(%s), SUM(%s)
 		FROM rollup_usage_daily r
 		JOIN agents a ON a.id = r.agent_id
 		LEFT JOIN workspaces w ON w.id = r.workspace_id
 		%s
 		GROUP BY grp
 		ORDER BY %s
-		%s`, groupExpr, where, orderExpr, limitClause), args...)
+		%s`, groupExpr,
+		"r.cost_nanos", "r.cost_reported_nanos", "r.cost_estimated_nanos",
+		"r.unpriced_input_tokens", "r.unpriced_output_tokens",
+		"r.unpriced_cache_read_tokens", "r.unpriced_cache_write_tokens",
+		where, orderExpr, limitClause), args...)
 	if err != nil {
 		return nil, fmt.Errorf("aggregating usage: %w", err)
 	}
@@ -122,15 +138,26 @@ func (s *Service) Usage(ctx context.Context, f UsageFilter) ([]UsageRow, error) 
 	var out []UsageRow
 	for rows.Next() {
 		var r UsageRow
-		var minPriced int
+		var amount, reported, estimated pricing.Amount
+		var unpriced TokenTotals
 		if err := rows.Scan(&r.Group, &r.Sessions, &r.Messages,
 			&r.Tokens.Input, &r.Tokens.Output,
 			&r.Tokens.CacheRead, &r.Tokens.CacheWrite,
-			&r.CostUSD, &r.CostReportedUSD, &r.CostEstimatedUSD,
-			&minPriced); err != nil {
+			&amount, &reported, &estimated,
+			&unpriced.Input, &unpriced.Output,
+			&unpriced.CacheRead, &unpriced.CacheWrite); err != nil {
 			return nil, err
 		}
-		r.HasUnpriced = minPriced == 0
+		r.CostUSD = amount.USD()
+		r.CostUSDExact = amount.String()
+		r.CostReportedUSD = reported.USD()
+		r.CostReportedUSDExact = reported.String()
+		r.CostEstimatedUSD = estimated.USD()
+		r.CostEstimatedUSDExact = estimated.String()
+		r.HasUnpriced = tokenTotal(unpriced) > 0
+		if r.HasUnpriced {
+			r.UnpricedTokenTypes = &unpriced
+		}
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {

@@ -6,7 +6,14 @@ import {
   useParams,
   useSearch,
 } from "@tanstack/react-router";
-import { api, fmtCount, fmtTokens, shortPath } from "../api";
+import {
+  api,
+  fmtCount,
+  fmtTokens,
+  plural,
+  shortPath,
+  type Relation,
+} from "../api";
 import { ErrorPanel } from "../ErrorState";
 import {
   AgentChip,
@@ -21,26 +28,119 @@ import {
   TokenMixBar,
 } from "../ui";
 import { Transcript } from "./session/Transcript";
+import { ContextTab } from "./session/ContextChart";
+import { EventList, groupPRs, PRLink } from "./insights/events";
 import {
   ArtifactsTab,
   CommandsTab,
   FilesTab,
+  SubagentsTab,
   ToolsTab,
   groupFiles,
 } from "./session/tabs";
 import { useSessionTools, useTranscriptWindow } from "./session/useSessionData";
 
-const TABS = ["transcript", "commands", "tools", "files", "artifacts"] as const;
+const TABS = [
+  "transcript",
+  "commands",
+  "tools",
+  "files",
+  "artifacts",
+  "subagents",
+  "events",
+  "context",
+] as const;
 type Tab = (typeof TABS)[number];
 
 // A ?tab= from the URL is any string until proven otherwise.
 const isTab = (v: string | undefined): v is Tab => TABS.some((t) => t === v);
+
+// SessionPRs shows the pull requests this session opened or checked.
+function SessionPRs({
+  agent,
+  sessionId,
+}: {
+  agent: string;
+  sessionId: string;
+}) {
+  const q = useQuery({
+    queryKey: ["sessionEvents", agent, sessionId, "pr_link"],
+    queryFn: () =>
+      api.sessionEvents({ agent, session: sessionId, kind: "pr_link" }),
+  });
+  const prs = groupPRs(q.data ?? []);
+  if (prs.length === 0) return null;
+  return (
+    <div className="mb-2 flex flex-wrap items-baseline gap-2 text-xs">
+      <span className="font-mono text-micro text-ink-faint">pull requests</span>
+      {prs.map((pr) => (
+        <span
+          key={pr.url}
+          className="rounded border border-edge px-2 py-0.5 font-mono"
+        >
+          <PRLink pr={pr} />
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// SessionEvents lists the session's events, fetched when the tab opens.
+function SessionEvents({
+  agent,
+  sessionId,
+  onJump,
+}: {
+  agent: string;
+  sessionId: string;
+  onJump: (seq: number) => void;
+}) {
+  const q = useQuery({
+    queryKey: ["sessionEvents", agent, sessionId],
+    queryFn: () =>
+      api.sessionEvents({ agent, session: sessionId, limit: 1000 }),
+  });
+  if (q.isLoading) return <SkeletonRows rows={4} />;
+  if (q.error) return <LoadError error={q.error} />;
+  return (
+    <div className="overflow-hidden rounded-md border border-edge">
+      <EventList
+        events={q.data ?? []}
+        showSession={false}
+        onJump={onJump}
+        empty="No events recorded for this session."
+      />
+    </div>
+  );
+}
+
+// relationLabel reads an edge from this session's side.
+function relationLabel(r: Relation, subagentType?: string): string {
+  const out = r.direction === "out";
+  switch (r.kind) {
+    case "subagent_of":
+      return `${subagentType || "subagent"} of`;
+    case "resumed_from":
+      return out ? "resumed from" : "continued in";
+    case "fork_of":
+      return out ? "fork of" : "forked into";
+    default:
+      return out ? r.kind : `${r.kind} (incoming)`;
+  }
+}
 
 // The gathering point of the session-centric model: one session with its
 // transcript, commands, tool calls, files touched, usage, relations, and
 // linked artifacts — each facet a deep-linkable tab (?tab=). The paging
 // and anchoring machinery all lives in ./session/useSessionData.
 export function SessionDetailPage() {
+  const { agent, sessionId } = useParams({
+    from: "/sessions/$agent/$sessionId",
+  });
+  return <SessionContent key={`${agent}/${sessionId}`} />;
+}
+
+function SessionContent() {
   const { agent, sessionId } = useParams({
     from: "/sessions/$agent/$sessionId",
   });
@@ -97,6 +197,7 @@ export function SessionDetailPage() {
       </div>
     );
   const s = detail.data!;
+  const eventCount = Object.values(s.events ?? {}).reduce((a, b) => a + b, 0);
   // Badge counts for the tab bar; transcript carries none. The
   // tool-derived counts are withheld until the rows have actually loaded —
   // they load lazily, so rendering the not-yet-known value would label a
@@ -122,13 +223,28 @@ export function SessionDetailPage() {
     tools: toolCountsKnown ? toolRows.length : null,
     files: toolCountsKnown ? files.length : null,
     artifacts: s.artifacts?.length ?? 0,
+    subagents: s.subagentCount ?? 0,
+    events: eventCount,
+    context: null,
   };
+  // Most sessions spawn nothing and record no events; those tabs appear
+  // only when there is something in them.
+  const tabs = TABS.filter((t) => {
+    if (t === "subagents" || t === "events") return (counts[t] ?? 0) > 0;
+    if (t === "context") return s.tokens.input + s.tokens.cacheRead > 0;
+    return true;
+  });
+  // The subagent_of edges are the subagents tab; only the outgoing one (a
+  // subagent naming its parent) belongs beside the models.
+  const relations = s.relations?.filter(
+    (r) => r.kind !== "subagent_of" || r.direction === "out",
+  );
 
   return (
     <div>
       <div className="mb-1 flex items-baseline gap-3">
         <AgentChip agent={s.agent} />
-        <h1 className="truncate text-xl font-semibold">
+        <h1 className="min-w-0 flex-1 truncate text-xl font-semibold">
           {s.title || "(untitled)"}
         </h1>
       </div>
@@ -152,7 +268,13 @@ export function SessionDetailPage() {
       <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-6">
         <StatTile
           label="Cost"
-          value={<Money usd={s.costUSD} unpriced={s.unpricedTokens} />}
+          value={
+            <Money
+              usd={s.costUSD}
+              incomplete={(s.unpricedTokens ?? 0) > 0}
+              title={`$${s.costUSDExact}`}
+            />
+          }
         />
         {s.tokens.input > 0 && (
           <StatTile label="Input" value={fmtTokens(s.tokens.input)} />
@@ -165,6 +287,30 @@ export function SessionDetailPage() {
         )}
         <StatTile label="Messages" value={fmtCount(s.messages)} />
         <StatTile label="Tool calls" value={fmtCount(s.toolCalls)} />
+        {s.lines && (
+          <StatTile
+            label="Lines changed"
+            value={
+              <span className="tabular-nums">
+                <span className="text-ok">+{fmtCount(s.lines.added)}</span>{" "}
+                <span className="text-warn">−{fmtCount(s.lines.removed)}</span>
+              </span>
+            }
+            detail={plural(s.lines.files, "file")}
+          />
+        )}
+        {s.subagentTotal && (
+          <StatTile
+            label="Subagent cost"
+            value={
+              <Money
+                usd={s.subagentTotal.costUSD}
+                incomplete={(s.subagentTotal.unpricedTokens ?? 0) > 0}
+                title={`$${s.subagentTotal.costUSDExact} across ${s.subagentTotal.sessions} subagent sessions`}
+              />
+            }
+          />
+        )}
       </div>
 
       {s.tokens.input +
@@ -181,12 +327,16 @@ export function SessionDetailPage() {
 
       {s.unpricedTokens ? (
         <p className="mb-4 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn">
-          {fmtTokens(s.unpricedTokens)} tokens use a model the pricing table
-          can't resolve — the cost shown is a lower bound.
+          {fmtTokens(s.unpricedTokens)} tokens have no resolvable model or
+          bucket rate — the API-equivalent cost shown is a lower bound.
         </p>
       ) : null}
 
-      {(s.relations?.length || s.models?.length) && (
+      {(s.events?.pr_link ?? 0) > 0 && (
+        <SessionPRs agent={agent} sessionId={sessionId} />
+      )}
+
+      {(relations?.length || s.models?.length) && (
         <div className="mb-4 flex flex-wrap gap-2 text-xs">
           {s.models?.map((m) => (
             <span
@@ -196,15 +346,28 @@ export function SessionDetailPage() {
               {m}
             </span>
           ))}
-          {s.relations?.map((r) => (
+          {relations?.map((r) => (
             <Link
-              key={`${r.kind}-${r.sessionId}`}
+              key={`${r.kind}-${r.direction}-${r.sessionId}`}
               to="/sessions/$agent/$sessionId"
               params={{ agent: s.agent, sessionId: r.sessionId }}
+              // atSeq is a seq in the PARENT: the link opens the parent at
+              // the branch point; from the parent's side, at the child's
+              // start.
+              search={
+                r.direction === "out" && r.atSeq !== undefined
+                  ? { seq: r.atSeq }
+                  : {}
+              }
+              title={
+                r.atSeq !== undefined
+                  ? `Branched after message #${r.atSeq} of the parent`
+                  : undefined
+              }
               className="rounded border border-accent/40 px-2 py-0.5 font-mono text-accent hover:bg-surface-2"
             >
-              {r.direction === "out" ? r.kind : `${r.kind} (incoming)`} →{" "}
-              {r.sessionId.slice(0, 8)}
+              {relationLabel(r, s.subagentType)} → {r.sessionId.slice(0, 8)}
+              {r.atSeq !== undefined && ` @#${r.atSeq}`}
             </Link>
           ))}
         </div>
@@ -228,7 +391,7 @@ export function SessionDetailPage() {
               replace: true,
             })
           }
-          options={TABS.map((t) => ({
+          options={tabs.map((t) => ({
             value: t,
             label: t,
             badge: counts[t] === null ? undefined : fmtCount(counts[t]),
@@ -271,6 +434,23 @@ export function SessionDetailPage() {
         )}
       {tab === "artifacts" && (
         <ArtifactsTab agent={s.agent} artifacts={s.artifacts ?? []} />
+      )}
+      {tab === "subagents" && (
+        <SubagentsTab subagents={s.subagents ?? []} total={s.subagentTotal} />
+      )}
+      {tab === "context" && (
+        <ContextTab
+          agent={agent}
+          sessionId={sessionId}
+          onJump={win.jumpToSeq}
+        />
+      )}
+      {tab === "events" && (
+        <SessionEvents
+          agent={agent}
+          sessionId={sessionId}
+          onJump={win.jumpToSeq}
+        />
       )}
     </div>
   );

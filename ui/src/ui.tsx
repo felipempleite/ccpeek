@@ -120,16 +120,16 @@ export function PageHeader({
 // Money renders a cost figure. Cost is deliberately NOT green: green
 // reads as "good", and it collided with the ok/warn semantics the scan
 // findings depend on. The number carries itself in tabular mono; warn is
-// reserved for the cases that genuinely warrant attention — an unpriced
-// lower bound.
+// reserved for the cases that genuinely warrant attention — incomplete
+// cost coverage.
 export function Money({
   usd,
-  unpriced,
+  incomplete = false,
   className = "",
   title,
 }: {
   usd: number;
-  unpriced?: number;
+  incomplete?: boolean;
   className?: string;
   title?: string;
 }) {
@@ -138,15 +138,15 @@ export function Money({
     <span
       title={
         title ??
-        (unpriced
-          ? "Contains tokens with no resolvable price — a lower bound"
-          : undefined)
+        (incomplete
+          ? "API-equivalent value; some usage has no resolvable price — a lower bound"
+          : "API-equivalent value; reported by the agent where available, otherwise estimated from list rates")
       }
       className={`font-mono tabular-nums ${
-        unpriced ? "text-warn" : zero ? "text-ink-faint" : "text-ink"
+        incomplete ? "text-warn" : zero ? "text-ink-faint" : "text-ink"
       } ${className}`}
     >
-      {fmtCost(usd, unpriced)}
+      {fmtCost(usd, incomplete)}
     </span>
   );
 }
@@ -420,7 +420,8 @@ export function dropEmpty(
 }
 
 /** The routes whose search IS their filter state. */
-type FilterRoute = "/sessions" | "/commands" | "/usage" | "/artifacts";
+type FilterRoute =
+  "/sessions" | "/commands" | "/usage" | "/artifacts" | "/insights";
 
 /** useSetFilter is the one way those routes change a filter: merge the
  *  patch into the URL's search through dropEmpty, and REPLACE rather than
@@ -483,7 +484,7 @@ export function useUrlText(
 // up: acting on the page behind a modal is a worse answer than doing
 // nothing.
 function inTypingContext(e: KeyboardEvent): boolean {
-  const target = e.target as HTMLElement | null;
+  const target = e.target instanceof HTMLElement ? e.target : null;
   if (
     target?.isContentEditable ||
     (target?.tagName &&
@@ -712,6 +713,7 @@ const TOOL_COLOR: Record<string, string> = {
   discovery: "var(--color-tool-discovery)",
   web: "var(--color-tool-web)",
   subagent: "var(--color-tool-subagent)",
+  script: "var(--color-tool-script)",
 };
 
 export function toolColor(kind: string): string {
@@ -744,12 +746,14 @@ export function kindLabel(kind: string): string {
 export function KindBars({
   items,
   fmt = String,
+  empty = "No tool calls recorded.",
 }: {
   items: { label: string; count: number }[];
   fmt?: (n: number) => string;
+  empty?: string;
 }) {
   if (items.length === 0) {
-    return <EmptyNote>No tool calls recorded.</EmptyNote>;
+    return <EmptyNote>{empty}</EmptyNote>;
   }
   const max = Math.max(...items.map((i) => i.count), 1);
   return (

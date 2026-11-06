@@ -11,6 +11,8 @@ package canon
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -70,19 +72,20 @@ const (
 	OriginImportedV1 Origin = "imported-v1" // carried over from a v1 database
 )
 
-// SessionTitleLimit bounds Session.Title. Titles come from a first prompt,
-// which is unbounded; five adapters each carried this number.
+// SessionTitleLimit bounds Session.Title. Titles come from agent-provided
+// names or first-prompt fallbacks, either of which can be unbounded.
 const SessionTitleLimit = 200
 
 // Session is the hub of the model. ExternalID is the agent's own stable
 // identifier (session UUID, rollout id, …); (Agent, ExternalID) is the
 // natural key everything else attaches to.
 type Session struct {
-	Agent      AgentSlug
-	ExternalID string
-	Title      string // first prompt or agent-provided name
-	CreatedAt  time.Time
-	ModifiedAt time.Time
+	Agent         AgentSlug
+	ExternalID    string
+	Title         string // first prompt or agent-provided name
+	TitleOverride bool   // an explicit native rename should replace a stored fallback title
+	CreatedAt     time.Time
+	ModifiedAt    time.Time
 
 	// Context attributes — where the session ran, not hierarchy.
 	CWD       string
@@ -99,6 +102,9 @@ type SessionRelationKind string
 const (
 	RelResumedFrom SessionRelationKind = "resumed_from"
 	RelForkOf      SessionRelationKind = "fork_of"
+	// RelSubagentOf points a subagent's own session at the session (or
+	// parent subagent) that spawned it.
+	RelSubagentOf SessionRelationKind = "subagent_of"
 )
 
 // SessionRelation is a directed session→session edge. Both endpoints are
@@ -150,12 +156,29 @@ type Message struct {
 	Role        Role
 	Kind        MessageKind
 	CreatedAt   time.Time
+	Provider    string // upstream provider in effect, if the agent records it
 	Model       string // model in effect for this entry, if known
 	CWD         string // per-message cwd where the agent records it
 	IsSidechain bool   // subagent branch entries (Claude sidechains)
 	Content     json.RawMessage
 	Text        string
-	Usage       *Usage // assistant entries that report usage
+	// Thinking is the model's reasoning text where the agent records it in
+	// the clear. Kept apart from Text so search and titles stay on what
+	// was said, not on what was considered.
+	Thinking string
+	// Effort is the reasoning effort or thinking level the agent ran the
+	// entry at (low … max), where it records one.
+	Effort string
+	Images []ImageRef // images carried inside Content
+	Usage  *Usage     // assistant entries that report usage
+}
+
+// ImageRef locates one image inside Message.Content. Pointer is an RFC
+// 6901 JSON pointer to the base64 data, so the bytes are served from the
+// payload already stored rather than copied a second time.
+type ImageRef struct {
+	MediaType string `json:"mediaType"`
+	Pointer   string `json:"pointer"`
 }
 
 // Usage is per-message token accounting as reported by the agent.
@@ -174,14 +197,15 @@ type Message struct {
 // the informational detail either way and must never be added to
 // OutputTokens downstream.
 type Usage struct {
-	InputTokens      int64
-	OutputTokens     int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	ReasoningTokens  int64
-	ServiceTier      string
-	ReportedCostUSD  *float64
-	RequestID        string // dedupe key component for resumed/forked logs
+	InputTokens        int64
+	OutputTokens       int64
+	CacheReadTokens    int64
+	CacheWriteTokens   int64 // total cache writes, including CacheWrite1hTokens
+	CacheWrite1hTokens int64 // one-hour-TTL subset; legacy/unsplit writes are zero
+	ReasoningTokens    int64
+	ServiceTier        string
+	ReportedCostUSD    *float64
+	RequestID          string // dedupe key component for resumed/forked logs
 }
 
 // ToolKind is the shared taxonomy adapters normalize native tool names into.
@@ -196,7 +220,10 @@ const (
 	ToolDiscovery ToolKind = "discovery"
 	ToolSubagent  ToolKind = "subagent"
 	ToolWeb       ToolKind = "web"
-	ToolOther     ToolKind = "other"
+	// ToolScript is a tool that runs model-written code which calls other
+	// tools (Pi's codemode). Its source rides in ToolCall.Command.
+	ToolScript ToolKind = "script"
+	ToolOther  ToolKind = "other"
 )
 
 // ToolCall belongs to exactly one session, anchored to the message that
@@ -224,11 +251,54 @@ type ToolCall struct {
 	// then rendered as raw JSON. FilePath already established the pattern;
 	// these are its siblings.
 	FilePath string // primary file argument, when the tool has one
-	Command  string // shell command as a user would run it
+	Command  string // shell command as a user would run it; script source for ToolScript
 	OldText  string // file_edit: the replaced text, bounded
 	NewText  string // file_edit/file_write: the replacement, bounded
 
 	StartedAt time.Time
+	// DurationMs is the call's run time when the agent records it directly
+	// (Pi's nested calls); otherwise the store derives it from the
+	// result's arrival (ToolResult.At).
+	DurationMs int64
+	// Lines counts the lines a file change added and removed, when the
+	// call itself says (Codex patches, writes of a new file); nil when
+	// unknown. The result can supply it instead (ToolResult.Lines).
+	Lines *LineCounts
+}
+
+// LineCounts is a file change's size in lines.
+type LineCounts struct {
+	Added   int
+	Removed int
+}
+
+// CountDiffLines counts added and removed lines in diff text — unified
+// diffs, Codex patches, or Claude's structured patch lines — by their
+// +/- prefix. File headers ("+++ ", "--- ", "*** ") are not changes.
+func CountDiffLines(lines []string) LineCounts {
+	var c LineCounts
+	for _, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "+++ "), strings.HasPrefix(l, "--- "), strings.HasPrefix(l, "*** "):
+		case strings.HasPrefix(l, "+"):
+			c.Added++
+		case strings.HasPrefix(l, "-"):
+			c.Removed++
+		}
+	}
+	return c
+}
+
+// CountTextLines is the number of lines in text, as a new file's size.
+func CountTextLines(text string) int {
+	if text == "" {
+		return 0
+	}
+	n := strings.Count(text, "\n")
+	if !strings.HasSuffix(text, "\n") {
+		n++
+	}
+	return n
 }
 
 // ToolResultExcerptLimit bounds ResultExcerpt — a tool result is a whole
@@ -251,6 +321,85 @@ type ToolResult struct {
 	CallExternalID    string
 	Status            string // ok | error
 	Excerpt           string
+	Content           string      // full result when not retained in a message
+	At                time.Time   // when the result arrived, if recorded
+	Lines             *LineCounts // a file change's size, when the result reports it
+}
+
+// EventKind names a session event: something an agent recorded about a
+// session that is neither a message nor a tool call.
+type EventKind string
+
+const (
+	// EventAPIError is a model request that failed (rate limit, overload,
+	// connection, auth). Label is the error class; Status the HTTP status
+	// when the agent records one.
+	EventAPIError EventKind = "api_error"
+	// EventAborted is a turn the user or the agent cut short.
+	EventAborted EventKind = "aborted"
+	// EventToolDenied is a tool call refused before it ran — by the user,
+	// a permission rule, or an automatic mode. Label is the denial kind.
+	EventToolDenied EventKind = "tool_denied"
+	// EventPRLink is a pull request the session opened or worked on.
+	// Label is the repository; Detail the URL.
+	EventPRLink EventKind = "pr_link"
+	// EventTurn is one completed turn — prompt to final reply — with its
+	// wall time in DurationMs.
+	EventTurn EventKind = "turn"
+	// EventCompaction is the agent summarizing the context to free room.
+	// Label is the trigger (auto, manual) where recorded; the payload
+	// carries the token counts before and after.
+	EventCompaction EventKind = "compaction"
+	// EventHook is one run of a user-configured hook. Label is the hook
+	// event (PreToolUse, Stop, …), Detail the command, Status ok, error
+	// (non-zero exit), or blocked (the hook stopped the agent).
+	EventHook EventKind = "hook"
+)
+
+// JoinThinking joins a message's reasoning blocks into Message.Thinking,
+// dropping blank ones.
+func JoinThinking(blocks []string) string {
+	var kept []string
+	for _, b := range blocks {
+		if t := strings.TrimSpace(b); t != "" {
+			kept = append(kept, t)
+		}
+	}
+	return strings.Join(kept, "\n\n")
+}
+
+// CompactionDetail renders a compaction's token change for
+// SessionEvent.Detail; the after count is often unrecorded (zero).
+func CompactionDetail(before, after int64) string {
+	if after > 0 {
+		return fmt.Sprintf("%d → %d tokens", before, after)
+	}
+	return fmt.Sprintf("%d tokens before", before)
+}
+
+// EventKinds lists every EventKind, in documentation order.
+var EventKinds = []EventKind{
+	EventAPIError, EventAborted, EventToolDenied,
+	EventPRLink, EventTurn, EventCompaction, EventHook,
+}
+
+// EventDetailLimit bounds SessionEvent.Detail: an error message or a
+// command line, not a payload.
+const EventDetailLimit = 400
+
+// SessionEvent belongs to one session, anchored to the transcript entry it
+// arrived with. The few columns every surface filters or aggregates on are
+// typed; anything kind-specific rides in Payload.
+type SessionEvent struct {
+	SessionExternalID string
+	MessageSeq        int
+	Kind              EventKind
+	At                time.Time
+	Label             string // the kind's category: error class, denial kind, …
+	Status            string // outcome where the kind has one
+	DurationMs        int64
+	Detail            string // short human-readable text, bounded
+	Payload           json.RawMessage
 }
 
 // ArtifactKind names a sidecar artifact type.

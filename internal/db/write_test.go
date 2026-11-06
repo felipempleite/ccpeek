@@ -103,6 +103,43 @@ func TestUpsertSessionIdempotent(t *testing.T) {
 	}
 }
 
+func TestAdvanceSessionOnlyOverridesTitleForNativeRename(t *testing.T) {
+	s, _ := openTemp(t)
+	w := beginWrite(t, s)
+	if _, err := w.UpsertSession(testSession("sess-title"), "hash1"); err != nil {
+		t.Fatal(err)
+	}
+
+	fallback := testSession("sess-title")
+	fallback.Title = "later tail prompt"
+	if _, err := w.AdvanceSession(fallback, "hash2"); err != nil {
+		t.Fatal(err)
+	}
+	var title string
+	if err := w.tx.QueryRow(`SELECT title FROM sessions WHERE external_id = 'sess-title'`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "hello" {
+		t.Fatalf("ordinary tail title replaced original: %q", title)
+	}
+
+	rename := fallback
+	rename.Title = "user-assigned-name"
+	rename.TitleOverride = true
+	if _, err := w.AdvanceSession(rename, "hash3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tx.QueryRow(`SELECT title FROM sessions WHERE external_id = 'sess-title'`).Scan(&title); err != nil {
+		t.Fatal(err)
+	}
+	if title != "user-assigned-name" {
+		t.Fatalf("native rename title = %q, want user-assigned-name", title)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUsageDedupeAcrossSessions(t *testing.T) {
 	s, _ := openTemp(t)
 	w := beginWrite(t, s)
@@ -169,6 +206,53 @@ func TestUsageDedupeAcrossSessions(t *testing.T) {
 	}
 	if total != 2000 {
 		t.Errorf("summed input tokens = %d, want 2000", total)
+	}
+}
+
+func TestUsageDedupeLegacyAndMostCompleteSnapshot(t *testing.T) {
+	s, _ := openTemp(t)
+	w := beginWrite(t, s)
+	firstID, err := w.UpsertSession(testSession("first"), "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reported := 0.42
+	first := canon.Message{
+		Seq: 0, ContentID: "legacy-msg", Role: canon.RoleAssistant,
+		Usage: &canon.Usage{InputTokens: 10, OutputTokens: 2, ReportedCostUSD: &reported},
+	}
+	if err := w.InsertMessage(firstID, "claude-code", first); err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := w.UpsertSession(testSession("resumed"), "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := first
+	later.Usage = &canon.Usage{InputTokens: 10, OutputTokens: 8}
+	if err := w.InsertMessage(secondID, "claude-code", later); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM message_usage`); n != 1 {
+		t.Fatalf("usage rows = %d, want 1", n)
+	}
+	var owner, output, reportedNanos int64
+	var retainedCost float64
+	if err := s.db.QueryRow(`
+		SELECT m.session_id, u.output_tokens, u.reported_cost_usd, u.reported_cost_nanos
+		FROM message_usage u
+		JOIN messages m ON m.id = u.message_id`).Scan(&owner, &output, &retainedCost, &reportedNanos); err != nil {
+		t.Fatal(err)
+	}
+	if owner != firstID || output != 8 {
+		t.Errorf("owner/output = %d/%d, want first session %d and final output 8",
+			owner, output, firstID)
+	}
+	if retainedCost != reported || reportedNanos != 420_000_000 {
+		t.Errorf("reported cost = %v / %d nanos, want retained %v", retainedCost, reportedNanos, reported)
 	}
 }
 
@@ -400,7 +484,7 @@ func TestPruneMissingSourcesRemovesEverySourceOwnedRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{sessionSrc, artifactSrc, historySrc, keptSrc} {
-		if err := w.RecordSourceFile(p, "claude-code", "h", "stat", ""); err != nil {
+		if err := w.RecordSourceFile(p, "claude-code", "h", "stat", "", 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -460,7 +544,7 @@ func TestPruneKeepsImportedRows(t *testing.T) {
 	if _, err := w.UpsertSession(imported, "h"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.RecordSourceFile(imported.SourcePath, "claude-code", "h", "stat", ""); err != nil {
+	if err := w.RecordSourceFile(imported.SourcePath, "claude-code", "h", "stat", "", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Commit(); err != nil {

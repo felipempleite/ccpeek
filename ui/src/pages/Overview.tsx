@@ -34,7 +34,10 @@ import {
 // heatmap, and the relation facets (agents, workspaces, latest sessions,
 // latest file edits) — every figure links into its detail view.
 export function OverviewPage() {
-  const stats = useQuery({ queryKey: ["stats"], queryFn: api.stats });
+  const stats = useQuery({
+    queryKey: ["stats"],
+    queryFn: api.stats,
+  });
   const recent = useQuery({
     queryKey: ["sessions", "recent"],
     queryFn: () => api.sessions({ limit: "18" }),
@@ -101,7 +104,13 @@ export function OverviewPage() {
         />
         <StatTile
           label="Cost / month"
-          value={<Money usd={st.costMonthUSD} />}
+          value={
+            <Money
+              usd={st.costMonthUSD}
+              incomplete={(st.costMonthUnpricedTokens ?? 0) > 0}
+              title={`$${st.costMonthUSDExact}`}
+            />
+          }
           detail={`${fmtCost(st.costUSD)} all time`}
           to="/usage"
           spark={<Sparkline values={last30.map((d) => d.costUSD)} />}
@@ -167,8 +176,9 @@ export function OverviewPage() {
                       </span>
                       <Money
                         usd={s.costUSD}
-                        unpriced={s.unpricedTokens}
+                        incomplete={(s.unpricedTokens ?? 0) > 0}
                         className="shrink-0 text-xs"
+                        title={`$${s.costUSDExact}`}
                       />
                     </div>
                     <div className="mt-0.5 flex min-w-0 gap-3 font-mono text-meta text-ink-faint">
@@ -215,7 +225,12 @@ export function OverviewPage() {
                         {fmtTokens(a.tokens)} tok
                       </td>
                       <td className="px-3 py-1.5 text-right">
-                        <Money usd={a.costUSD} className="text-xs" />
+                        <Money
+                          usd={a.costUSD}
+                          incomplete={(a.unpricedTokens ?? 0) > 0}
+                          className="text-xs"
+                          title={`$${a.costUSDExact ?? a.costUSD}`}
+                        />
                       </td>
                     </tr>
                   ))}
@@ -374,7 +389,12 @@ function WorkspacesByCost({
                 style={{ width: `${Math.max((r.costUSD / max) * 100, 2)}%` }}
               />
             </span>
-            <Money usd={r.costUSD} className="shrink-0 text-meta" />
+            <Money
+              usd={r.costUSD}
+              incomplete={Boolean(r.hasUnpriced)}
+              className="shrink-0 text-meta"
+              title={`$${r.costUSDExact}`}
+            />
           </Link>
         </li>
       ))}
@@ -503,9 +523,10 @@ function Heatmap({ days }: { days: DayActivity[] }) {
           ))}
           {cells.map((c) => {
             const n = c.d?.sessions ?? 0;
+            const incomplete = (c.d?.unpricedTokens ?? 0) > 0;
             const label = `${c.day}: ${plural(n, "session")}${
               c.d && c.d.costUSD > 0 ? `, ${fmtCost(c.d.costUSD)}` : ""
-            }`;
+            }${incomplete ? ", incomplete cost coverage" : ""}`;
             const rect = (
               <rect
                 x={GUTTER + c.week * (CELL + GAP)}
@@ -514,6 +535,8 @@ function Heatmap({ days }: { days: DayActivity[] }) {
                 height={CELL}
                 rx={2}
                 fill={FILL[level(n)]}
+                stroke={incomplete ? "var(--color-warn)" : undefined}
+                strokeWidth={incomplete ? 2 : undefined}
               />
             );
             const tip = (
@@ -526,6 +549,12 @@ function Heatmap({ days }: { days: DayActivity[] }) {
                   <>
                     {" · "}
                     <span className="text-ink">{fmtCost(c.d.costUSD)}</span>
+                  </>
+                )}
+                {incomplete && (
+                  <>
+                    <br />
+                    <span className="text-warn">incomplete cost coverage</span>
                   </>
                 )}
               </>

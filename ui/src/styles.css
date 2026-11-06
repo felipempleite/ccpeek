@@ -87,6 +87,7 @@
   --color-tool-discovery: light-dark(#177a68, #73daca);
   --color-tool-web: light-dark(#b23a68, #d55181);
   --color-tool-subagent: light-dark(#6d4fc4, #bb9af7);
+  --color-tool-script: light-dark(#3760bf, #7aa2f7);
 }
 
 /* Theme selection: the system preference by default; data-theme (set by
@@ -208,7 +209,22 @@ body {
   @apply my-3 border-edge;
 }
 
-/* Syntax-highlight token colors need no rules here: the shiki theme in
-   highlight.ts styles tokens inline with the palette's light-dark()
+/* Syntax-highlight token colors need no rules here: the highlights theme
+   in highlight.ts styles tokens inline with the palette's light-dark()
    variables, which resolve against the active color-scheme like every
    other use of the tokens. */
+
+/* The diff view (@pierre/diffs) renders in a shadow root that reads its
+   colors and type from these inherited variables. */
+diffs-container {
+  --diffs-light-bg: var(--color-surface);
+  --diffs-dark-bg: var(--color-surface);
+  --diffs-light: var(--color-ink);
+  --diffs-dark: var(--color-ink);
+  --diffs-addition-color: var(--color-ok);
+  --diffs-deletion-color: var(--color-agent-cursor);
+  --diffs-font-family: var(--font-mono);
+  --diffs-header-font-family: var(--font-sans);
+  --diffs-font-size: var(--text-meta);
+  --diffs-line-height: calc(var(--text-meta) * 1.625);
+}

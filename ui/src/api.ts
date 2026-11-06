@@ -20,6 +20,25 @@ export interface SessionSummary {
   toolCalls: number;
   tokens: TokenTotals;
   costUSD: number;
+  costUSDExact: string;
+  costReportedUSD: number;
+  costReportedUSDExact: string;
+  costEstimatedUSD: number;
+  costEstimatedUSDExact: string;
+  unpricedTokens?: number;
+  unpricedTokenTypes?: TokenTotals;
+  /** Set on a subagent's session: the session that spawned it. */
+  parentId?: string;
+  subagentType?: string;
+  subagentCount?: number;
+}
+
+export interface SubagentTotal {
+  sessions: number;
+  messages: number;
+  tokens: TokenTotals;
+  costUSD: number;
+  costUSDExact: string;
   unpricedTokens?: number;
 }
 
@@ -27,6 +46,8 @@ export interface Relation {
   kind: string;
   direction: "in" | "out";
   sessionId: string;
+  /** Seq in the parent session where the child branched off. */
+  atSeq?: number;
 }
 
 export interface LinkedArtifact {
@@ -40,7 +61,91 @@ export interface SessionDetail extends SessionSummary {
   relations?: Relation[];
   artifacts?: LinkedArtifact[];
   models?: string[];
+  subagents?: SessionSummary[];
+  subagentTotal?: SubagentTotal;
+  /** Session events by kind (api_error, aborted, tool_denied, …). */
+  events?: Record<string, number>;
+  /** File churn, where change sizes are known. */
+  lines?: { added: number; removed: number; files: number };
 }
+
+export interface EffortRow {
+  agent?: string;
+  day?: string;
+  level: string;
+  requests: number;
+  tokens: TokenTotals;
+  costUSD: number;
+  costUSDExact: string;
+  unpricedTokens?: number;
+}
+
+export interface ChangeRow {
+  group: string;
+  added: number;
+  removed: number;
+  changes: number;
+  files: number;
+  sessions: number;
+}
+
+export interface EventRow {
+  agent: string;
+  sessionId: string;
+  sessionTitle: string;
+  messageSeq: number;
+  kind: string;
+  at?: string;
+  label?: string;
+  status?: string;
+  durationMs?: number;
+  detail?: string;
+  payload?: Record<string, unknown>;
+}
+
+export interface EventStat {
+  kind: string;
+  group: string;
+  count: number;
+  /** Events whose status is error or blocked. */
+  failures: number;
+  sessions: number;
+  totalMs?: number;
+  avgMs?: number;
+  maxMs?: number;
+}
+
+export interface ToolStat {
+  name: string;
+  kind: string;
+  calls: number;
+  errors: number;
+  sessions: number;
+  /** Calls whose duration is known; the timing figures cover only these. */
+  timed: number;
+  totalMs: number;
+  avgMs: number;
+  maxMs: number;
+}
+
+export interface ContextPoint {
+  seq: number;
+  at?: string;
+  promptTokens: number;
+  outputTokens: number;
+}
+
+export interface SessionContext {
+  points: ContextPoint[];
+  compactions: EventRow[];
+}
+
+/** Filters shared by the Insights reads. */
+export type InsightFilters = {
+  agent?: string;
+  since?: string;
+  until?: string;
+};
 
 export interface TranscriptMessage {
   seq: number;
@@ -49,11 +154,25 @@ export interface TranscriptMessage {
   role: string;
   kind: string;
   createdAt: string;
+  provider?: string;
   model?: string;
   isSidechain?: boolean;
   text: string;
   html?: string;
   content?: string;
+  thinking?: string;
+  images?: { index: number; mediaType: string }[];
+}
+
+/** messageImageUrl addresses one image of a transcript entry; the server
+ *  streams the bytes out of the stored payload. */
+export function messageImageUrl(
+  agent: string,
+  id: string,
+  seq: number,
+  index: number,
+): string {
+  return `/api/v1/sessions/${encodeURIComponent(agent)}/${encodeURIComponent(id)}/transcript/${seq}/images/${index}`;
 }
 
 export interface AgentStat {
@@ -62,12 +181,16 @@ export interface AgentStat {
   lastActive?: string;
   tokens: number;
   costUSD: number;
+  costUSDExact?: string;
+  unpricedTokens?: number;
 }
 
 export interface DayActivity {
   day: string;
   sessions: number;
   costUSD: number;
+  costUSDExact?: string;
+  unpricedTokens?: number;
 }
 
 export interface WorkspaceStat {
@@ -98,7 +221,11 @@ export interface Stats {
   scanFindings: number;
   tokens: number;
   costUSD: number;
+  costUSDExact: string;
+  unpricedTokens?: number;
   costMonthUSD: number;
+  costMonthUSDExact: string;
+  costMonthUnpricedTokens?: number;
   agents?: AgentStat[];
   activity?: DayActivity[];
   workspaces?: WorkspaceStat[];
@@ -137,9 +264,13 @@ export interface UsageRow {
   messages: number;
   tokens: TokenTotals;
   costUSD: number;
+  costUSDExact: string;
   costReportedUSD: number;
+  costReportedUSDExact: string;
   costEstimatedUSD: number;
+  costEstimatedUSDExact: string;
   hasUnpriced?: boolean;
+  unpricedTokenTypes?: TokenTotals;
 }
 
 export interface SearchHit {
@@ -203,11 +334,11 @@ async function unwrap<T>(res: Response): Promise<T> {
 
 async function get<T>(
   path: string,
-  params?: Record<string, string | undefined>,
+  params?: Record<string, string | number | undefined>,
 ): Promise<T> {
-  const entries = Object.entries(params ?? {}).filter(
-    (e): e is [string, string] => e[1] != null && e[1] !== "",
-  );
+  const entries = Object.entries(params ?? {})
+    .filter((e) => e[1] != null && e[1] !== "")
+    .map(([k, v]) => [k, String(v)]);
   const qs = entries.length
     ? "?" + new URLSearchParams(entries).toString()
     : "";
@@ -226,6 +357,7 @@ export const api = {
     query?: string;
     since?: string;
     until?: string;
+    subagents?: string;
     limit?: string;
     offset?: string;
   }) => get<SessionSummary[]>("/sessions", filters),
@@ -236,12 +368,18 @@ export const api = {
   transcript: (
     agent: string,
     id: string,
-    opts?: { fromSeq?: string; limit?: string; full?: string },
+    opts?: {
+      fromSeq?: string;
+      limit?: string;
+      full?: string;
+      thinking?: string;
+    },
   ) =>
     get<TranscriptMessage[]>(`/sessions/${agent}/${id}/transcript`, {
       from_seq: opts?.fromSeq,
       limit: opts?.limit,
       full: opts?.full,
+      thinking: opts?.thinking,
     }),
 
   usage: (filters: {
@@ -289,6 +427,33 @@ export const api = {
 
   sessionToolDetail: (agent: string, id: string, seq: number) =>
     get<ToolCallDetail>(`/sessions/${agent}/${id}/tools/${seq}`),
+
+  changes: (
+    f: InsightFilters & { group?: "day" | "agent" | "file"; limit?: number },
+  ) => get<ChangeRow[]>("/changes", f),
+
+  effort: (f: InsightFilters & { group?: "level" | "day" }) =>
+    get<EffortRow[]>("/effort", f),
+
+  sessionContext: (agent: string, id: string) =>
+    get<SessionContext>(`/sessions/${agent}/${id}/context`),
+
+  sessionEvents: (
+    f: InsightFilters & {
+      kind?: string;
+      status?: string;
+      session?: string;
+      sort?: "time" | "duration";
+      limit?: number;
+    },
+  ) => get<EventRow[]>("/session-events", f),
+
+  eventStats: (f: InsightFilters & { kind?: string; group?: string }) =>
+    get<EventStat[]>("/session-events/stats", f),
+
+  toolStats: (
+    f: InsightFilters & { sort?: "errors" | "total" | "avg"; limit?: number },
+  ) => get<ToolStat[]>("/tool-stats", f),
 };
 
 // The validated per-agent palette (also defined as CSS vars in
@@ -330,21 +495,27 @@ export function clipCommand(cmd: string, max = 60): string {
  *  precision. Zero now reads as an em dash (there is no cost, not a very
  *  small one) and sub-cent amounts say so rather than pretending to
  *  hundredths-of-a-cent accuracy. */
-export function fmtCost(usd: number, unpriced?: number): string {
-  if (!(usd > 0)) return unpriced ? "—+" : "—";
+export function fmtCost(usd: number, incomplete = false): string {
+  if (!(usd > 0)) return incomplete ? "—+" : "—";
   const cost =
     usd >= 1
       ? `$${usd.toFixed(2)}`
       : usd >= 0.01
         ? `$${usd.toFixed(3)}`
         : "<$0.01";
-  return unpriced ? `${cost}+` : cost;
+  return incomplete ? `${cost}+` : cost;
+}
+
+/** fmtCostDecimal retains API precision without a currency symbol, which is
+ *  useful for machine-readable exports as well as the exact UI formatter. */
+export function fmtCostDecimal(usd: number): string {
+  return usd.toFixed(6).replace(/0+$/, "").replace(/\.$/, ".00");
 }
 
 /** fmtCostExact is the full-precision figure for tooltips and titles,
  *  where the abbreviation in fmtCost would hide a real difference. */
 export function fmtCostExact(usd: number): string {
-  return `$${usd.toFixed(6).replace(/0+$/, "").replace(/\.$/, ".00")}`;
+  return `$${fmtCostDecimal(usd)}`;
 }
 
 /** fmtTokens abbreviates TOKEN magnitudes, where a thousands suffix is
@@ -426,7 +597,13 @@ export interface BlockRow {
   messages: number;
   tokens: TokenTotals;
   costUSD: number;
+  costUSDExact: string;
+  costReportedUSD: number;
+  costReportedUSDExact: string;
+  costEstimatedUSD: number;
+  costEstimatedUSDExact: string;
   unpricedTokens?: number;
+  unpricedTokenTypes?: TokenTotals;
   active?: boolean;
 }
 
@@ -444,7 +621,30 @@ async function send<T>(
   );
 }
 
+export interface ArchiveStatus {
+  schemaVersion: number;
+  generation: number;
+  derivedDirty: boolean;
+  pendingSessions: number;
+  importedSessions: number;
+  scan: {
+    completedAt?: string;
+    pending: boolean;
+    scope: string;
+    generation: number;
+    rulesFingerprint?: string;
+    currentRulesFingerprint: string;
+  };
+  lastRun?: {
+    status: string;
+    warnings: number;
+    parseFailures: number;
+    truncations: number;
+  };
+}
+
 export const parityApi = {
+  archiveStatus: () => get<ArchiveStatus>("/archive-status"),
   artifacts: (kind?: string, agent?: string, limit = 100, offset = 0) =>
     get<ArtifactSummary[]>("/artifacts", {
       kind: kind ?? "",
@@ -464,5 +664,8 @@ export const parityApi = {
   scanIgnore: (id: number, ignored: boolean) =>
     send<{ ignored: boolean }>("POST", `/scan/${id}/ignore`, { ignored }),
   blocks: (limit = 24, agent = "") =>
-    get<BlockRow[]>("/blocks", { limit: String(limit), agent }),
+    get<BlockRow[]>("/blocks", {
+      limit: String(limit),
+      agent,
+    }),
 };

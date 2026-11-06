@@ -9,7 +9,7 @@ import {
   shortPath,
   type SessionDetail,
 } from "../api";
-import { fmtWhen } from "../time";
+import { fmtDuration, fmtWhen } from "../time";
 import {
   AgentChip,
   AgentDot,
@@ -47,7 +47,10 @@ export function ComparePage() {
           type="button"
           onClick={() =>
             void navigate({
-              search: { a: b || undefined, b: a || undefined },
+              search: {
+                a: b || undefined,
+                b: a || undefined,
+              },
               replace: true,
             })
           }
@@ -160,8 +163,8 @@ function ComparisonTable({
             label="Cost"
             a={left.costUSD}
             b={right.costUSD}
-            formatA={(n) => fmtCost(n, left.unpricedTokens)}
-            formatB={(n) => fmtCost(n, right.unpricedTokens)}
+            formatA={(n) => fmtCost(n, (left.unpricedTokens ?? 0) > 0)}
+            formatB={(n) => fmtCost(n, (right.unpricedTokens ?? 0) > 0)}
             deltaFormat={(n) => fmtCost(n)}
             direction="lower"
             cost
@@ -244,7 +247,11 @@ function SessionPicker({
   const q = useDebounced(qInput, 250);
   const sessions = useQuery({
     queryKey: ["compare-sessions", q],
-    queryFn: () => api.sessions({ query: q, limit: String(PICKER_PAGE) }),
+    queryFn: () =>
+      api.sessions({
+        query: q,
+        limit: String(PICKER_PAGE),
+      }),
     placeholderData: (prev) => prev,
   });
   const list = sessions.data ?? [];
@@ -299,7 +306,12 @@ function SessionPicker({
                   <span className="min-w-0 flex-1 truncate text-sm">
                     {s.title || s.id}
                   </span>
-                  <Money usd={s.costUSD} className="shrink-0 text-meta" />
+                  <Money
+                    usd={s.costUSD}
+                    incomplete={(s.unpricedTokens ?? 0) > 0}
+                    className="shrink-0 text-meta"
+                    title={`$${s.costUSDExact}`}
+                  />
                 </span>
                 <span className="font-mono text-meta text-ink-faint">
                   {fmtWhen(s.modifiedAt)} · {shortPath(s.cwd)}
@@ -464,20 +476,7 @@ function durationMs(session: SessionDetail): number {
     : 0;
 }
 
-function fmtDuration(ms: number): string {
-  const seconds = Math.round(ms / 1_000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainder = minutes % 60;
-  if (hours < 24)
-    return remainder > 0 ? `${hours}h ${remainder}m` : `${hours}h`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h`;
-}
-
-function useQueryDetail(agent?: string, id?: string) {
+function useQueryDetail(agent: string | undefined, id: string | undefined) {
   return useQuery({
     queryKey: ["session", agent, id],
     queryFn: () => api.session(agent!, id!),

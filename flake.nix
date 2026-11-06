@@ -25,7 +25,18 @@
         self',
         lib,
         ...
-      }: {
+      }: let
+        # Go 1.26.10 fixes stdlib vulnerabilities that fail govulncheck
+        # (nixpkgs still ships 1.26.7). Drop this override and use
+        # pkgs.go directly once nixpkgs catches up.
+        go_1_26_10 = pkgs.go.overrideAttrs {
+          version = "1.26.10";
+          src = pkgs.fetchurl {
+            url = "https://go.dev/dl/go1.26.10.src.tar.gz";
+            hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
+          };
+        };
+      in {
         packages = {
           default = self'.packages.ccpeek;
 
@@ -41,13 +52,15 @@
 
             nativeBuildInputs = with pkgs; [
               nodejs
-              pnpm_10.configHook
+              pnpmConfigHook
+              pnpm_10
             ];
 
-            pnpmDeps = pkgs.pnpm_10.fetchDeps {
+            pnpmDeps = pkgs.fetchPnpmDeps {
               inherit (finalAttrs) pname version src;
+              pnpm = pkgs.pnpm_10;
               fetcherVersion = 3;
-              hash = "sha256-Ia1Wq128ZM7rAS3OED69TkjC4vG/k94UNqA5MC8egco=";
+              hash = "sha256-K/MHamYj6/rYbDRzTYlZ4pCXEyVAHMScwwKQniaBv2o=";
             };
 
             buildPhase = ''
@@ -65,15 +78,13 @@
             '';
           });
 
-          # go_1_25 (1.25.12) matches go.mod's toolchain line; the default
-          # pkgs.go (1.26.4) carries GO-2026-5856 and fails govulncheck.
-          ccpeek = (pkgs.buildGoModule.override {go = pkgs.go_1_25;}) {
+          ccpeek = (pkgs.buildGoModule.override {go = go_1_26_10;}) {
             pname = "ccpeek";
-            version = "2.0.0";
+            version = "2.3.1";
 
             src = lib.cleanSource ./.;
 
-            vendorHash = "sha256-4EnkrZU0jTweP5icq+LfzGN20eKLMls/yk4Qx8cwDNw=";
+            vendorHash = "sha256-aqVRziqnlmvX0HeClzefAIJ34GcyuIiV1S4UHpV74QQ=";
 
             ldflags = [
               "-s"
@@ -150,7 +161,7 @@
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            go_1_25 # 1.25.12, the go.mod toolchain; pkgs.go 1.26.4 fails govulncheck (GO-2026-5856)
+            go_1_26_10
             go-tools # includes staticcheck
             gofumpt
             gomodifytags

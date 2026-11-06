@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ahmedelgabri/ccpeek/internal/agent"
@@ -32,14 +33,25 @@ const (
 	maxLineBytes = 10 * 1024 * 1024
 )
 
-// Adapter implements agent.Adapter for Codex CLI.
-type Adapter struct{}
+// Adapter implements agent.Adapter for Codex CLI. Discover snapshots the
+// optional thread-name index once per root so concurrent rollout parses do not
+// rescan the same sidecar for every session.
+type Adapter struct {
+	mu          sync.RWMutex
+	threadNames map[string]map[string]string
+}
 
 // New returns the Codex adapter.
-func New() *Adapter { return &Adapter{} }
+func New() *Adapter { return &Adapter{threadNames: make(map[string]map[string]string)} }
 
 // Slug implements agent.Adapter.
 func (*Adapter) Slug() canon.AgentSlug { return Slug }
+
+// ParseVersion forces existing recoverable rollouts through the latest usage
+// normalization, session-title enrichment, session_meta model fallback,
+// turn and tool timing, reasoning effort, and custom (freeform) tools with
+// content-item outputs.
+func (*Adapter) ParseVersion() int { return 8 }
 
 // RootSpec implements agent.Adapter: Codex relocates via CODEX_HOME.
 func (*Adapter) RootSpec() agent.RootSpec {
@@ -49,14 +61,24 @@ func (*Adapter) RootSpec() agent.RootSpec {
 	}
 }
 
-// Discover walks sessions/YYYY/MM/DD/*.jsonl.
-func (*Adapter) Discover(ctx context.Context, root agent.Root) ([]agent.SourceRef, error) {
+// Discover walks sessions/YYYY/MM/DD/*.jsonl and snapshots the optional
+// session_index.jsonl that records user-assigned Codex thread names.
+func (a *Adapter) Discover(ctx context.Context, root agent.Root) ([]agent.SourceRef, error) {
+	indexPath := filepath.Join(root.Path, "session_index.jsonl")
+	names, err := loadThreadNames(indexPath)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	a.threadNames[root.Path] = names
+	a.mu.Unlock()
+
 	sessionsDir := filepath.Join(root.Path, "sessions")
 	if _, err := os.Stat(sessionsDir); os.IsNotExist(err) {
 		return nil, nil
 	}
 	var refs []agent.SourceRef
-	err := filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // unreadable subtree: pipeline diagnostics cover it
 		}
@@ -64,7 +86,12 @@ func (*Adapter) Discover(ctx context.Context, root agent.Root) ([]agent.SourceRe
 			return cerr
 		}
 		if !d.IsDir() && strings.HasSuffix(d.Name(), ".jsonl") {
-			refs = append(refs, agent.SourceRef{Root: root, Path: path, Kind: agent.SourceFile})
+			// The index is one shared sidecar, so any rename invalidates every
+			// rollout. That favors correct titles over selective reparse complexity.
+			refs = append(refs, agent.SourceRef{
+				Root: root, Path: path, Kind: agent.SourceFile,
+				CompanionPaths: []string{indexPath},
+			})
 		}
 		return nil
 	})
@@ -72,6 +99,44 @@ func (*Adapter) Discover(ctx context.Context, root agent.Root) ([]agent.SourceRe
 		return nil, err
 	}
 	return refs, nil
+}
+
+type threadIndexEntry struct {
+	ID         string `json:"id"`
+	ThreadName string `json:"thread_name"`
+}
+
+func loadThreadNames(path string) (map[string]string, error) {
+	names := make(map[string]string)
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return names, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("opening Codex session index %s: %w", path, err)
+	}
+	defer f.Close()
+
+	err = jsonl.Scan(f, maxLineBytes, func(_ int, raw []byte) error {
+		var entry threadIndexEntry
+		if json.Unmarshal(raw, &entry) == nil && entry.ID != "" {
+			name := strings.TrimSpace(entry.ThreadName)
+			if name != "" {
+				names[entry.ID] = name // later rename entries win
+			}
+		}
+		return nil
+	}, func(_ int, _ int64) error { return nil })
+	if err != nil {
+		return nil, fmt.Errorf("reading Codex session index %s: %w", path, err)
+	}
+	return names, nil
+}
+
+func (a *Adapter) threadName(root, sessionID string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.threadNames[root][sessionID]
 }
 
 type rolloutLine struct {
@@ -87,40 +152,94 @@ type sessionMeta struct {
 	Git       struct {
 		Branch string `json:"branch"`
 	} `json:"git"`
+	// Current Codex writes the session's model only here; turn_context,
+	// the older carrier, appears in a minority of rollouts. Without this
+	// most Codex messages had no model and so no price.
+	BaseInstructions struct {
+		Provenance struct {
+			Model string `json:"model"`
+		} `json:"provenance"`
+	} `json:"base_instructions"`
 }
 
 type turnContext struct {
-	Model string `json:"model"`
-	CWD   string `json:"cwd"`
+	Model  string `json:"model"`
+	CWD    string `json:"cwd"`
+	Effort string `json:"effort"`
 }
 
 type responseItem struct {
-	Type    string `json:"type"` // message | function_call | function_call_output
+	// message | function_call | function_call_output |
+	// custom_tool_call | custom_tool_call_output
+	Type    string `json:"type"`
 	Role    string `json:"role"`
 	Content []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
 	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Arguments string `json:"arguments"` // function_call: JSON in a string
+	Input     string `json:"input"`     // custom_tool_call: freeform text
 	CallID    string `json:"call_id"`
-	Output    string `json:"output"`
+	// Either a string or an array of content items (codex-rs
+	// FunctionCallOutputPayload); decoding it as a string failed the whole
+	// item, which dropped most results.
+	Output toolOutput `json:"output"`
+}
+
+// toolOutput is a tool output flattened to text as the item decodes.
+type toolOutput string
+
+func (o *toolOutput) UnmarshalJSON(raw []byte) error {
+	*o = toolOutput(outputText(raw))
+	return nil
+}
+
+// outputText flattens a tool output: the string itself, or the text of
+// its content items joined by newlines (images are dropped, as Codex's own
+// to_text does).
+func outputText(raw []byte) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var items []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &items) != nil {
+		return ""
+	}
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.Text != "" {
+			parts = append(parts, it.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 type eventMsg struct {
 	Type string          `json:"type"`
 	Info json.RawMessage `json:"info"`
+
+	// type == "task_complete": one turn. Older rollouts carry only the
+	// Unix-second bounds; newer ones the exact duration and first-token
+	// latency too.
+	StartedAt          int64  `json:"started_at"`
+	CompletedAt        int64  `json:"completed_at"`
+	DurationMs         *int64 `json:"duration_ms"`
+	TimeToFirstTokenMs *int64 `json:"time_to_first_token_ms"`
 }
 
-// tokenUsage mirrors Codex's token_count payloads. reasoning_output_tokens
-// is a SUBSET of output_tokens, not an additional bucket — real rollouts
-// show total_tokens == input_tokens + output_tokens with reasoning ≤
-// output (OpenAI Responses semantics, where reasoning is a detail of
-// billable output). Cost and totals must therefore use output alone;
-// adding reasoning on top would double-count it.
+// tokenUsage mirrors Codex's token_count payloads. The response API reports
+// cached reads and cache writes as disjoint details of input_tokens; its own
+// parser fixture uses 40 cached + 60 written = 100 input. Reasoning is likewise
+// a subset of output_tokens. Canonical ordinary input must subtract both cache
+// details, while output must not add reasoning again.
 type tokenUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`
+	CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
 	OutputTokens          int64 `json:"output_tokens"`
 	ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
 	TotalTokens           int64 `json:"total_tokens"`
@@ -148,6 +267,10 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 		ExternalID: fallbackID,
 		SourcePath: src.Path,
 	}
+	if title := a.threadName(src.Root.Path, fallbackID); title != "" {
+		sess.Title = canon.TruncateBytes(title, canon.SessionTitleLimit)
+		sess.TitleOverride = true
+	}
 
 	// Records stream to the sink as they parse — memory stays bounded by
 	// one line, not the rollout. The session is emitted before its first
@@ -165,6 +288,9 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 		tokens       tokenState
 		pendingAsst  *canon.Message
 		emitted      bool
+
+		// From turn_context, which few rollouts carry; empty otherwise.
+		currentEffort string
 	)
 	emitSession := func() error {
 		if emitted {
@@ -217,6 +343,10 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 			if json.Unmarshal(line.Payload, &meta) == nil {
 				if meta.ID != "" && !emitted {
 					sess.ExternalID = meta.ID
+					if title := a.threadName(src.Root.Path, meta.ID); title != "" {
+						sess.Title = canon.TruncateBytes(title, canon.SessionTitleLimit)
+						sess.TitleOverride = true
+					}
 				} else if meta.ID != "" && meta.ID != sess.ExternalID {
 					// Children already carry the earlier id; switching now
 					// would orphan them. Keep the id and say so.
@@ -230,6 +360,9 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 				}
 				sess.CWD = meta.CWD
 				sess.GitBranch = meta.Git.Branch
+				// A turn_context seen later still wins: it records model
+				// switches within the session.
+				currentModel = cmp.Or(currentModel, meta.BaseInstructions.Provenance.Model)
 				if !meta.Timestamp.IsZero() {
 					sess.CreatedAt = meta.Timestamp
 				}
@@ -237,8 +370,9 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 
 		case "turn_context":
 			var tc turnContext
-			if json.Unmarshal(line.Payload, &tc) == nil && tc.Model != "" {
-				currentModel = tc.Model
+			if json.Unmarshal(line.Payload, &tc) == nil {
+				currentModel = cmp.Or(tc.Model, currentModel)
+				currentEffort = cmp.Or(tc.Effort, currentEffort)
 			}
 
 		case "response_item":
@@ -262,60 +396,105 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 					Text:      itemText(item),
 				}
 				messageCount++
-				if msg.Role == canon.RoleUser && sess.Title == "" && msg.Text != "" {
-					sess.Title = canon.TruncateBytes(strings.TrimSpace(msg.Text), canon.SessionTitleLimit)
+				if msg.Role == canon.RoleUser && sess.Title == "" {
+					if title := codexPromptTitle(msg.Text); title != "" {
+						sess.Title = canon.TruncateBytes(title, canon.SessionTitleLimit)
+					}
 				}
 				if msg.Role == canon.RoleAssistant {
+					msg.Effort = currentEffort
 					pendingAsst = &msg
 					return nil
 				}
 				return emitMessage(msg)
 
-			case "function_call":
+			case "function_call", "custom_tool_call":
 				if err := flushPending(); err != nil {
 					return err
 				}
 				if err := emitSession(); err != nil {
 					return err
 				}
-				argsJSON := argumentsJSON(item.Arguments)
-				args := toolArgs(argsJSON)
-				tc := canon.ToolCall{
-					SessionExternalID: sess.ExternalID,
-					MessageSeq:        max(messageCount-1, 0),
-					Seq:               toolCount,
-					ExternalID:        item.CallID,
-					Name:              item.Name,
-					Kind:              normalizeTool(item.Name),
-					Input:             json.RawMessage(argsJSON),
-					FilePath:          args.Path,
-					Command:           args.command(),
-					OldText:           args.OldText,
-					NewText:           cmp.Or(args.NewText, args.Content),
-					StartedAt:         line.Timestamp,
+				// A function call carries JSON arguments; a custom tool call
+				// freeform text (a patch, a code-mode script), stored under
+				// "input".
+				var input json.RawMessage
+				var args codexToolArgs
+				text := item.Input
+				if item.Type == "function_call" {
+					argsJSON := argumentsJSON(item.Arguments)
+					input = json.RawMessage(argsJSON)
+					args = toolArgs(argsJSON)
+					// Older Codex sent the patch as a JSON function argument.
+					text = args.Input
+				} else {
+					input, _ = json.Marshal(map[string]string{"input": item.Input})
+				}
+				messageSeq := max(messageCount-1, 0)
+				var tc canon.ToolCall
+				if item.Name == "apply_patch" {
+					tc = patchCall(sess.ExternalID, messageSeq, toolCount, item, input, text, line.Timestamp)
+				} else {
+					tc = canon.ToolCall{
+						SessionExternalID: sess.ExternalID,
+						MessageSeq:        messageSeq,
+						Seq:               toolCount,
+						ExternalID:        item.CallID,
+						Name:              item.Name,
+						Kind:              normalizeTool(item.Name),
+						Input:             input,
+						FilePath:          args.Path,
+						Command:           args.command(),
+						OldText:           args.OldText,
+						NewText:           cmp.Or(args.NewText, args.Content),
+						StartedAt:         line.Timestamp,
+					}
+					if tc.Kind == canon.ToolScript {
+						tc.Command = text
+					}
 				}
 				toolCount++
 				return sink.ToolCall(tc)
 
-			case "function_call_output":
+			case "function_call_output", "custom_tool_call_output":
 				if item.CallID == "" {
 					return nil
 				}
 				if err := emitSession(); err != nil {
 					return err
 				}
-				out := canon.TruncateBytes(strings.TrimSpace(item.Output), canon.ToolResultExcerptLimit)
+				text := string(item.Output)
 				return sink.ToolResult(canon.ToolResult{
 					SessionExternalID: sess.ExternalID,
 					CallExternalID:    item.CallID,
 					Status:            "ok",
-					Excerpt:           out,
+					Excerpt:           canon.TruncateBytes(strings.TrimSpace(text), canon.ToolResultExcerptLimit),
+					Content:           text,
+					At:                line.Timestamp,
 				})
 			}
 
 		case "event_msg":
 			var ev eventMsg
-			if json.Unmarshal(line.Payload, &ev) != nil || ev.Type != "token_count" {
+			if json.Unmarshal(line.Payload, &ev) != nil {
+				return nil
+			}
+			if ev.Type == "task_complete" {
+				turn, ok := turnEvent(ev, line.Timestamp)
+				if !ok {
+					return nil
+				}
+				if err := flushPending(); err != nil {
+					return err
+				}
+				if err := emitSession(); err != nil {
+					return err
+				}
+				turn.SessionExternalID = sess.ExternalID
+				turn.MessageSeq = max(messageCount-1, 0)
+				return sink.SessionEvent(turn)
+			}
+			if ev.Type != "token_count" {
 				return nil
 			}
 			var info tokenCountInfo
@@ -326,11 +505,26 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 			if delta == nil {
 				return nil
 			}
+			ordinaryInput := delta.InputTokens - delta.CachedInputTokens - delta.CacheWriteInputTokens
+			if ordinaryInput < 0 {
+				if err := sink.Issue(canon.Issue{
+					Agent: Slug, Severity: canon.SeverityWarn, Category: "usage",
+					SourcePath: src.Path, Line: lineNo,
+					Detail: fmt.Sprintf(
+						"Codex input subsets exceed input total (%d cached + %d cache write > %d input); clamping ordinary input to zero",
+						delta.CachedInputTokens, delta.CacheWriteInputTokens, delta.InputTokens,
+					),
+				}); err != nil {
+					return err
+				}
+				ordinaryInput = 0
+			}
 			usage := &canon.Usage{
-				InputTokens:     delta.InputTokens - delta.CachedInputTokens,
-				OutputTokens:    delta.OutputTokens,
-				CacheReadTokens: delta.CachedInputTokens,
-				ReasoningTokens: delta.ReasoningOutputTokens,
+				InputTokens:      ordinaryInput,
+				OutputTokens:     delta.OutputTokens,
+				CacheReadTokens:  delta.CachedInputTokens,
+				CacheWriteTokens: delta.CacheWriteInputTokens,
+				ReasoningTokens:  delta.ReasoningOutputTokens,
 			}
 			// Attach to the held assistant message when one is waiting;
 			// otherwise (the count preceded the assistant text, as Codex
@@ -346,6 +540,7 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 				Kind:      canon.KindInfo,
 				CreatedAt: line.Timestamp,
 				Model:     currentModel,
+				Effort:    currentEffort,
 				Content:   line.Payload,
 				Usage:     usage,
 			}
@@ -372,6 +567,27 @@ func (a *Adapter) Parse(ctx context.Context, src agent.SourceRef, sink agent.Rec
 
 	// Final emit: the folded title, timestamps, cwd, and branch.
 	return sink.Session(sess)
+}
+
+// turnEvent reads a task_complete event's wall time: the exact duration
+// when recorded, else the Unix-second bounds. A turn with neither is not
+// measured, and one shorter than a second by its bounds is reported as
+// such rather than as zero.
+func turnEvent(ev eventMsg, at time.Time) (canon.SessionEvent, bool) {
+	var ms int64
+	switch {
+	case ev.DurationMs != nil:
+		ms = *ev.DurationMs
+	case ev.StartedAt > 0 && ev.CompletedAt >= ev.StartedAt:
+		ms = max((ev.CompletedAt-ev.StartedAt)*1000, 1)
+	default:
+		return canon.SessionEvent{}, false
+	}
+	turn := canon.SessionEvent{Kind: canon.EventTurn, At: at, DurationMs: ms}
+	if ev.TimeToFirstTokenMs != nil {
+		turn.Payload, _ = json.Marshal(map[string]int64{"timeToFirstTokenMs": *ev.TimeToFirstTokenMs})
+	}
+	return turn, true
 }
 
 // tokenState is one rollout's token_count bookkeeping: the last cumulative
@@ -423,6 +639,7 @@ func perTurnUsage(info tokenCountInfo, st *tokenState) *tokenUsage {
 	return &tokenUsage{
 		InputTokens:           cur.InputTokens - p.InputTokens,
 		CachedInputTokens:     cur.CachedInputTokens - p.CachedInputTokens,
+		CacheWriteInputTokens: cur.CacheWriteInputTokens - p.CacheWriteInputTokens,
 		OutputTokens:          cur.OutputTokens - p.OutputTokens,
 		ReasoningOutputTokens: cur.ReasoningOutputTokens - p.ReasoningOutputTokens,
 		TotalTokens:           cur.TotalTokens - p.TotalTokens,
@@ -449,6 +666,56 @@ func itemText(item responseItem) string {
 	return strings.Join(parts, "\n")
 }
 
+// codexPromptTitle rejects user-role context envelopes injected by Codex.
+// They remain transcript provenance but do not describe the session's purpose.
+func codexPromptTitle(text string) string {
+	title := strings.TrimSpace(text)
+	for _, prefix := range []string{
+		"<environment_context>",
+		"<permissions",
+		"<recommended_plugins>",
+		"<user_instructions>",
+	} {
+		if strings.HasPrefix(title, prefix) {
+			return ""
+		}
+	}
+	return title
+}
+
+// patchCall records an apply_patch call: a file change on the patch's
+// first file, sized by its +/- lines (one patch can touch several files;
+// the input keeps them all).
+func patchCall(sessionID string, messageSeq, seq int, item responseItem, input json.RawMessage, patch string, at time.Time) canon.ToolCall {
+	lines := strings.Split(patch, "\n")
+	c := canon.CountDiffLines(lines)
+	return canon.ToolCall{
+		SessionExternalID: sessionID,
+		MessageSeq:        messageSeq,
+		Seq:               seq,
+		ExternalID:        item.CallID,
+		Name:              item.Name,
+		Kind:              canon.ToolFileEdit,
+		Input:             input,
+		FilePath:          patchFile(lines),
+		Lines:             &c,
+		StartedAt:         at,
+	}
+}
+
+// patchFile is the first file an apply_patch touches.
+func patchFile(lines []string) string {
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		for _, marker := range []string{"*** Update File: ", "*** Add File: ", "*** Delete File: "} {
+			if path, ok := strings.CutPrefix(l, marker); ok {
+				return strings.TrimSpace(path)
+			}
+		}
+	}
+	return ""
+}
+
 // codexToolArgs is the subset of a function call's arguments the
 // canonical record keeps beside the verbatim JSON.
 //
@@ -457,11 +724,13 @@ func itemText(item responseItem) string {
 // what the commands browser did before Command existed, so every Codex row
 // read as `["bash","-lc","go test ./..."]`.
 type codexToolArgs struct {
-	Command []string `json:"command"`
-	Path    string   `json:"path"`
-	OldText string   `json:"old_text"`
-	NewText string   `json:"new_text"`
-	Content string   `json:"content"`
+	Command json.RawMessage `json:"command"`
+	Cmd     string          `json:"cmd"`
+	Path    string          `json:"path"`
+	OldText string          `json:"old_text"`
+	NewText string          `json:"new_text"`
+	Content string          `json:"content"`
+	Input   string          `json:"input"` // apply_patch (older JSON form)
 }
 
 func toolArgs(raw string) codexToolArgs {
@@ -474,15 +743,21 @@ func toolArgs(raw string) codexToolArgs {
 // shell wrapper is unwrapped — `["bash","-lc","go test ./..."]` is the
 // script, not three arguments — and anything else is joined.
 func (a codexToolArgs) command() string {
-	switch {
-	case len(a.Command) == 0:
-		return ""
-	case len(a.Command) == 3 && strings.HasPrefix(a.Command[1], "-") &&
-		strings.Contains(a.Command[1], "c"):
-		return a.Command[2]
-	default:
-		return strings.Join(a.Command, " ")
+	if a.Cmd != "" {
+		return a.Cmd
 	}
+	var script string
+	if json.Unmarshal(a.Command, &script) == nil {
+		return script
+	}
+	var argv []string
+	if json.Unmarshal(a.Command, &argv) != nil {
+		return ""
+	}
+	if len(argv) == 3 && strings.HasPrefix(argv[1], "-") && strings.Contains(argv[1], "c") {
+		return argv[2]
+	}
+	return strings.Join(argv, " ")
 }
 
 // argumentsJSON keeps the function-call arguments as raw JSON; Codex
@@ -501,7 +776,7 @@ func argumentsJSON(args string) string {
 
 func normalizeTool(name string) canon.ToolKind {
 	switch name {
-	case "shell", "local_shell", "exec_command":
+	case "shell", "local_shell", "exec_command", "shell_command":
 		return canon.ToolShell
 	case "apply_patch":
 		return canon.ToolFileEdit
@@ -509,6 +784,10 @@ func normalizeTool(name string) canon.ToolKind {
 		return canon.ToolFileRead
 	case "web_search":
 		return canon.ToolWeb
+	case "exec":
+		// Code mode: model-written JavaScript calling Codex's tools, like
+		// Pi's codemode.
+		return canon.ToolScript
 	default:
 		return canon.ToolOther
 	}

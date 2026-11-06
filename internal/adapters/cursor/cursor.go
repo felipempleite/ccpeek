@@ -32,6 +32,7 @@ import (
 
 	"github.com/ahmedelgabri/ccpeek/internal/agent"
 	"github.com/ahmedelgabri/ccpeek/internal/canon"
+	"github.com/ahmedelgabri/ccpeek/internal/sqliteutil"
 	_ "modernc.org/sqlite"
 )
 
@@ -160,7 +161,7 @@ type blobRow struct {
 
 // Parse opens the per-session database read-only and emits its records.
 func (a *Adapter) parseStore(ctx context.Context, src agent.SourceRef, sink agent.RecordSink) error {
-	sdb, err := sql.Open("sqlite", "file:"+src.Path+"?mode=ro&_pragma=busy_timeout(5000)")
+	sdb, err := sql.Open("sqlite", sqliteutil.URI(src.Path, "mode=ro&_pragma=busy_timeout(5000)"))
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", src.Path, err)
 	}
@@ -189,7 +190,9 @@ func (a *Adapter) parseStore(ctx context.Context, src agent.SourceRef, sink agen
 				(meta.Name == "" && meta.WorkspaceRoot == "" && meta.CreatedAt == 0) {
 				continue
 			}
-			sess.Title = canon.TruncateBytes(meta.Name, canon.SessionTitleLimit)
+			name := strings.TrimSpace(meta.Name)
+			sess.Title = canon.TruncateBytes(name, canon.SessionTitleLimit)
+			sess.TitleOverride = name != ""
 			sess.CWD = meta.WorkspaceRoot
 			if meta.CreatedAt > 0 {
 				sess.CreatedAt = time.UnixMilli(meta.CreatedAt).UTC()

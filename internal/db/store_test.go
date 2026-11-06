@@ -111,6 +111,75 @@ func TestReadsDontQueueBehindWrites(t *testing.T) {
 // on: every version between baseVersion and schemaVersion has exactly
 // one registered migration (pre-release both are equal and the slice is
 // empty).
+func TestV13CostMigrationPreservesArchiveAndAddsColumns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v13.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use the real table relationships rather than column stubs: later
+	// migrations legitimately need to recover data through those relationships.
+	if _, err := raw.ExecContext(ctx, derivedSchema+derivedVirtualSchema+userSchema); err != nil {
+		t.Fatal(err)
+	}
+	for table, columns := range map[string][]string{
+		"messages":           {"provider", "text_content", "usage_request_id", "thinking_text", "images_json", "effort"},
+		"tool_calls":         {"result_content", "started_ms", "duration_ms", "lines_added", "lines_removed"},
+		"message_usage":      {"cache_write_1h_tokens", "reported_cost_nanos"},
+		"source_files":       {"parse_version"},
+		"rollup_usage_daily": {"unpriced_input_tokens", "unpriced_output_tokens", "unpriced_cache_read_tokens", "unpriced_cache_write_tokens", "cost_nanos", "cost_reported_nanos", "cost_estimated_nanos"},
+	} {
+		for _, column := range columns {
+			if _, err := raw.ExecContext(ctx, "ALTER TABLE "+table+" DROP COLUMN "+column); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, q := range []string{
+		`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`INSERT INTO meta VALUES ('schema_version', '13')`,
+		`INSERT INTO agents(id,slug) VALUES(1,'claude-code')`,
+		`INSERT INTO sessions(id,agent_id,external_id) VALUES(1,1,'retained')`,
+		`INSERT INTO messages(id,session_id,seq,role,content_id) VALUES(1,1,0,'assistant','request-content')`,
+		`INSERT INTO search_docs(session_id,doc_type,seq,text_content) VALUES(1,'message',0,'retained text')`,
+		`INSERT INTO message_usage(message_id,reported_cost_usd,request_id) VALUES (1,0.125,'req1')`,
+		`INSERT INTO source_files(path,agent_id,content_hash,indexed_at) VALUES ('kept',1,'h','')`,
+		`INSERT INTO rollup_usage_daily(day,agent_id) VALUES ('2026-01-01',1)`,
+		`INSERT INTO rollup_session_days(day,agent_id,session_id) VALUES ('2026-01-01',1,1)`,
+	} {
+		if _, err := raw.ExecContext(ctx, q); err != nil {
+			raw.Close()
+			t.Fatalf("seed v13: %v (%s)", err, q)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if n := count(t, s, `SELECT COUNT(*) FROM messages`); n != 1 {
+		t.Errorf("archive messages = %d, want preserved", n)
+	}
+	if n := count(t, s, `SELECT COUNT(*) FROM rollup_usage_daily`); n != 0 {
+		t.Errorf("rollups = %d, want invalidated", n)
+	}
+	var reportedNanos int64
+	if err := s.db.QueryRowContext(ctx, `SELECT reported_cost_nanos FROM message_usage WHERE message_id = 1`).Scan(&reportedNanos); err != nil || reportedNanos != 125_000_000 {
+		t.Errorf("reported cost backfill = %d, %v; want 125000000", reportedNanos, err)
+	}
+	for table, column := range map[string]string{
+		"messages": "provider", "message_usage": "reported_cost_nanos",
+		"source_files": "parse_version", "rollup_usage_daily": "cost_nanos",
+	} {
+		if n := count(t, s, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column); n != 1 {
+			t.Errorf("%s.%s missing after migration", table, column)
+		}
+	}
+}
+
 func TestMigrationInvariant(t *testing.T) {
 	if len(migrations) != schemaVersion-baseVersion {
 		t.Fatalf("len(migrations) = %d, want schemaVersion-baseVersion = %d",
@@ -537,5 +606,56 @@ func TestResetDerivedRebuildsTheSearchIndex(t *testing.T) {
 		if _, err := s.db.ExecContext(ctx, `SELECT COUNT(*) FROM `+table); err != nil {
 			t.Errorf("derived table %s missing after reset: %v", table, err)
 		}
+	}
+}
+
+// v1 indexed some Pi session files as Claude sessions, and the importer
+// brought them in as claude-code orphans beside the Pi sessions v2 parses
+// from the same files. v24 drops exactly those duplicates — with their
+// search docs, so FTS stays consistent — and keeps every other orphan.
+func TestV24DropsV1DuplicatesOfLiveSessions(t *testing.T) {
+	ctx := context.Background()
+	store, path := openTemp(t)
+	w, err := store.BeginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := w.UpsertSession(canon.Session{Agent: "pi", ExternalID: "same-uuid", SourcePath: "/pi/s.jsonl"}, "h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dup, err := w.UpsertSession(canon.Session{Agent: "claude-code", ExternalID: "same-uuid", Origin: canon.OriginImportedV1, SourcePath: "/pi/s.jsonl"}, "imported-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := w.UpsertSession(canon.Session{Agent: "claude-code", ExternalID: "gone-uuid", Origin: canon.OriginImportedV1}, "imported-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int64{live, dup, orphan} {
+		if err := w.WriteMessage(id, "claude-code", canon.Message{Role: canon.RoleUser, Kind: canon.KindMessage, Text: "needle"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE meta SET value='23' WHERE key='schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	store, err = Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if n := count(t, store, `SELECT COUNT(*) FROM sessions WHERE id = ?`, dup); n != 0 {
+		t.Error("v1 duplicate of a live session survived")
+	}
+	if n := count(t, store, `SELECT COUNT(*) FROM sessions WHERE id IN (?, ?)`, live, orphan); n != 2 {
+		t.Error("migration removed the live session or a genuine orphan")
+	}
+	if n := count(t, store, `SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH 'needle'`); n != 2 {
+		t.Errorf("search hits = %d, want 2 (the duplicate's doc removed, FTS in step)", n)
 	}
 }

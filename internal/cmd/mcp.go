@@ -124,7 +124,7 @@ func runMCP(cmd *cobra.Command, stdin io.Reader, stdout, logw io.Writer, debounc
 }
 
 // liveIndex is the MCP server's index pipeline: bootstrap, then the
-// secret scan, then the fsnotify watch loop — the serving path's order,
+// secret scan, then the watch loop — the serving path's order,
 // for the serving path's reason (the scanner pages messages across
 // several read snapshots, so an ingest running under it could pair a new
 // content hash with a stale page set; watch passes scan inside onChange,
@@ -149,18 +149,19 @@ func liveIndex(ctx context.Context, eng *engine, bootstrap func(context.Context)
 			return
 		}
 		if err := index.during(func() error {
-			return scanChanged(ctx, eng, eng.report, logf)
+			return scanPending(ctx, eng, logf)
 		}); err != nil && ctx.Err() == nil {
 			logf("WARNING: %v\n", err)
 		}
 	}
-	if err := eng.runner.Watch(ctx, opts, debounce, func(rep *ingest.Report) {
+	opts.WatchPass = func() {
 		if err := index.during(func() error {
-			return scanChanged(ctx, eng, rep, logf)
+			return scanPending(ctx, eng, logf)
 		}); err != nil && ctx.Err() == nil {
 			logf("WARNING: %v\n", err)
 		}
-	}); err != nil && ctx.Err() == nil {
+	}
+	if err := eng.runner.Watch(ctx, opts, debounce, nil); err != nil && ctx.Err() == nil {
 		logf("WARNING: not watching for new sessions (serving the archive as last indexed): %v\n", err)
 	}
 }

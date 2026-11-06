@@ -7,7 +7,7 @@ import {
   useNavigate,
   useSearch,
 } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { useCallback, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { OverviewPage } from "./pages/Overview";
 import { SessionsPage } from "./pages/Sessions";
@@ -18,44 +18,57 @@ import { ArtifactsPage } from "./pages/Artifacts";
 import { ArtifactDetailPage } from "./pages/ArtifactDetail";
 import { ScanPage } from "./pages/Scan";
 import { ComparePage } from "./pages/Compare";
+import { InsightsPage } from "./pages/Insights";
 import { Palette } from "./Palette";
 import { NAV } from "./nav";
 import { ErrorBoundary, ErrorPanel } from "./ErrorState";
 import { useThemePref, type ThemePref } from "./theme";
 import { PALETTE_KEY, isApple, openPalette, useKeyShortcut } from "./ui";
 import { useEffect } from "react";
+import type { ArchiveStatus } from "./api";
 
 // The health endpoint's terminal state for a pass that gave up. Both the
 // v1 import and the bootstrap index are read against it, in three places.
 const FAILED = "failed";
 
-// IndexingBanner shows while the server's initial index pass runs — the
+// ArchiveContent waits for the database to open before mounting data pages.
+// The startup banner shows while initialization and indexing run; the
 // UI is up immediately (serve-first startup), pages fill in live as data
 // lands (SSE notifies fire during the pass), and the banner carries the
 // real counter so the wait never looks hung. It also surfaces a failed
 // v1 import: the server retries on every start, but until one succeeds
 // the failure must stay visible, not vanish into a startup log line.
-function IndexingBanner() {
-  const { data } = useQuery({
+function ArchiveContent({ children }: { children: ReactNode }) {
+  const { data, isError, refetch } = useQuery({
     queryKey: ["health"],
     queryFn: async () => {
       const res = await fetch("/api/v1/health");
+      if (!res.ok) throw new Error(`Health check failed (${res.status})`);
       const body: {
         data?: {
           indexing?: boolean;
+          initializing?: boolean;
           progress?: { agent: string; seen: number; changed: number };
           v1Import?: { state: string; error?: string };
           bootstrap?: { state: string; error?: string };
+          archive?: ArchiveStatus;
         };
       } = await res.json();
-      return body.data ?? {};
+      if (!body.data) throw new Error("Missing archive health status");
+      return body.data;
     },
-    // Poll only while progress can actually arrive: a failed pass holds
+    // Unknown health and transport failures must retry without window focus.
+    // Once health is known, poll only while progress can arrive: a failed pass holds
     // indexing=true until a restart, and 1.5s polls against that state
-    // would spin forever for no news.
+    // would spin forever for no news. A durable running row may belong to
+    // another process or an interrupted pass; poll until a writer finishes
+    // or recovers it, since that process cannot send this server's SSE events.
     refetchInterval: (query) =>
-      query.state.data?.indexing &&
-      query.state.data?.bootstrap?.state !== FAILED
+      !query.state.data ||
+      query.state.status === "error" ||
+      query.state.data.archive?.lastRun?.status === "running" ||
+      (query.state.data.indexing &&
+        query.state.data.bootstrap?.state !== FAILED)
         ? 1500
         : false,
   });
@@ -64,16 +77,34 @@ function IndexingBanner() {
   // progress is coming until a restart retries it — an indefinite
   // "indexing…" banner would be a lie.
   const indexFailed = data?.bootstrap?.state === FAILED;
-  if (!data?.indexing && !importFailed) return null;
+  const partial = data?.archive?.lastRun?.status === "partial";
+  const unfinished = data?.archive?.lastRun?.status === "running";
   const p = data?.progress;
   return (
     <>
+      {unfinished && !data?.indexing && (
+        <div
+          role="status"
+          className="mb-6 rounded-md border border-warn/50 bg-warn/10 px-4 py-2 text-sm text-ink-dim"
+        >
+          An index pass is running or was interrupted. History may be
+          incomplete. If no indexing process is active, run{" "}
+          <code>ccpeek ingest</code> to retry.
+        </div>
+      )}
+      {partial && (
+        <div className="mb-6 rounded-md border border-warn/50 bg-warn/10 px-4 py-2 text-sm text-ink-dim">
+          Some sources could not be indexed. History may be incomplete. Run{" "}
+          <code>ccpeek ingest</code> to see the errors and retry.
+        </div>
+      )}
       {indexFailed && (
         <div className="mb-6 flex items-baseline gap-3 rounded-md border border-red-500/50 bg-surface-1 px-4 py-2 text-sm text-ink-dim">
           <span className="inline-block h-1.5 w-1.5 shrink-0 self-center rounded-full bg-red-500" />
           <span>
-            Indexing failed — showing what was indexed before the error.
-            Restart ccpeek to retry the pass.
+            {data?.initializing
+              ? "Archive initialization failed. Check the terminal and restart ccpeek to retry."
+              : "Indexing failed. Showing what was indexed before the error. Restart ccpeek to retry the pass."}
           </span>
           {data?.bootstrap?.error && (
             <span
@@ -104,10 +135,12 @@ function IndexingBanner() {
         </div>
       )}
       {data?.indexing && !indexFailed && (
-        <div className="mb-6 flex items-baseline gap-3 rounded-md border border-accent/40 bg-surface-1 px-4 py-2 text-sm text-ink-dim">
-          <span className="inline-block h-1.5 w-1.5 shrink-0 animate-pulse self-center rounded-full bg-accent" />
+        <div className="mb-6 flex items-baseline gap-3 rounded-md border border-warn/50 bg-warn/10 px-4 py-2 text-sm text-ink-dim">
+          <span className="inline-block h-1.5 w-1.5 shrink-0 animate-pulse self-center rounded-full bg-warn" />
           <span>
-            Indexing your agent history — pages fill in live as data lands.
+            {data?.initializing
+              ? "Opening your archive. Waiting for database initialization or maintenance to finish."
+              : "Indexing your agent history. Pages fill in live as data lands."}
           </span>
           {p && p.seen > 0 && (
             <span className="ml-auto shrink-0 font-mono text-xs text-ink-faint tabular-nums">
@@ -117,6 +150,24 @@ function IndexingBanner() {
           )}
         </div>
       )}
+      {!data && isError && (
+        <div
+          role="alert"
+          className="mb-6 rounded-md border border-warn/50 p-4 text-sm"
+        >
+          Unable to read archive status. Retrying automatically.{" "}
+          <button
+            type="button"
+            className="text-accent underline"
+            onClick={() => void refetch()}
+          >
+            Retry now
+          </button>
+        </div>
+      )}
+      {!data
+        ? !isError && <div role="status">Connecting to archive…</div>
+        : !data.initializing && children}
     </>
   );
 }
@@ -161,6 +212,7 @@ const NAV_ABBR: Record<string, string> = {
   Overview: "O",
   Sessions: "Se",
   Usage: "U",
+  Insights: "In",
   Commands: "Co",
   Artifacts: "A",
   Scan: "Sc",
@@ -323,9 +375,7 @@ function Layout() {
         <SidebarFooter collapsed={collapsed} onToggle={toggleSidebar} />
       </aside>
 
-      <div
-        className={`min-w-0 flex-1 ${collapsed ? "md:pl-12" : "md:pl-52"}`}
-      >
+      <div className={`min-w-0 flex-1 ${collapsed ? "md:pl-12" : "md:pl-52"}`}>
         <div className="mx-auto max-w-[1500px] px-5 py-5">
           {/* Below md the rail becomes a real disclosure menu. The old
               fallback wrapped every link inline around the logo, which
@@ -368,12 +418,13 @@ function Layout() {
               </nav>
             )}
           </div>
-          <IndexingBanner />
-          {/* Inside the layout, so a failing route keeps the nav rail
-              and the user can move on rather than facing a blank page. */}
-          <ErrorBoundary>
-            <Outlet />
-          </ErrorBoundary>
+          <ArchiveContent>
+            {/* Inside the layout, so a failing route keeps the nav rail
+                and the user can move on rather than facing a blank page. */}
+            <ErrorBoundary>
+              <Outlet />
+            </ErrorBoundary>
+          </ArchiveContent>
         </div>
       </div>
       <Palette />
@@ -438,7 +489,15 @@ const routeTree = rootRoute.addChildren([
     component: SessionsPage,
     // Only non-empty filters serialize, keeping /sessions URLs clean.
     validateSearch: (s: Record<string, unknown>) =>
-      pickStrings(s, ["agent", "q", "project", "model", "since", "until"]),
+      pickStrings(s, [
+        "agent",
+        "q",
+        "project",
+        "model",
+        "since",
+        "until",
+        "subagents",
+      ]),
   }),
   createRoute({
     getParentRoute: () => rootRoute,
@@ -449,7 +508,12 @@ const routeTree = rootRoute.addChildren([
       const { tab } = pickStrings(s, ["tab"]);
       const out: { tab?: string; seq?: number } = {};
       if (tab !== undefined && tab !== "transcript") out.tab = tab;
-      if (typeof s.seq === "number") out.seq = s.seq;
+      if (
+        typeof s.seq === "number" &&
+        Number.isSafeInteger(s.seq) &&
+        s.seq >= 0
+      )
+        out.seq = s.seq;
       return out;
     },
   }),
@@ -473,6 +537,14 @@ const routeTree = rootRoute.addChildren([
     // "day" is the default grouping and stays out of the URL.
     validateSearch: (s: Record<string, unknown>) =>
       pickStrings(s, ["group", "agent", "model", "since", "until"]),
+  }),
+  createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/insights",
+    component: InsightsPage,
+    // The first tab is the default and stays out of the URL.
+    validateSearch: (s: Record<string, unknown>) =>
+      pickStrings(s, ["tab", "agent", "since", "until"]),
   }),
   // /search has no page of its own any more — searching is the palette,
   // reachable from every view. The ROUTE survives because the v1

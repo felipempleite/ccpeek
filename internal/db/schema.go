@@ -20,7 +20,7 @@ import (
 // the corpus. (initialSchema still moves WITH each migration so fresh
 // databases are born at the latest version; the migration entry is what
 // carries existing archives forward.)
-const schemaVersion = 13
+const schemaVersion = 24
 
 // baseVersion is the oldest schema version this build can upgrade from:
 // migrations[i] upgrades baseVersion+i to baseVersion+i+1, so
@@ -110,10 +110,19 @@ CREATE TABLE IF NOT EXISTS messages (
 	role TEXT NOT NULL,
 	kind TEXT NOT NULL DEFAULT 'message',
 	created_at TEXT,
+	provider TEXT NOT NULL DEFAULT '',
 	model TEXT NOT NULL DEFAULT '',
 	cwd TEXT NOT NULL DEFAULT '',
 	is_sidechain INTEGER NOT NULL DEFAULT 0,
 	content TEXT NOT NULL DEFAULT '',
+	text_content TEXT NOT NULL DEFAULT '',
+	usage_request_id TEXT NOT NULL DEFAULT '',
+	-- Reasoning text and image locators (canon.ImageRef JSON) lifted out
+	-- of content by the adapter; '' when the entry has none.
+	thinking_text TEXT NOT NULL DEFAULT '',
+	images_json TEXT NOT NULL DEFAULT '',
+	-- Reasoning effort / thinking level in effect (canon.Message.Effort).
+	effort TEXT NOT NULL DEFAULT '',
 	UNIQUE (session_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
@@ -126,9 +135,15 @@ CREATE TABLE IF NOT EXISTS message_usage (
 	output_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 	cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+	-- One-hour-TTL subset of cache_write_tokens. Zero on legacy rows whose
+	-- source did not expose (or no longer exists to recover) the split.
+	cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
 	reasoning_tokens INTEGER NOT NULL DEFAULT 0,
 	service_tier TEXT NOT NULL DEFAULT '',
 	reported_cost_usd REAL,
+	-- Exact fixed-point mirror used for all arithmetic. REAL remains as a
+	-- compatibility/provenance column for existing tooling.
+	reported_cost_nanos INTEGER,
 	request_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_message_usage_request ON message_usage(request_id) WHERE request_id <> '';
@@ -146,6 +161,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 	input_json TEXT NOT NULL DEFAULT '{}',
 	result_status TEXT NOT NULL DEFAULT '',
 	result_excerpt TEXT NOT NULL DEFAULT '',
+	result_content TEXT NOT NULL DEFAULT '',
 	-- Normalized arguments, lifted out of input_json by the adapter that
 	-- knows the agent's shape (see canon.ToolCall). Cross-agent surfaces
 	-- read these; input_json keeps the native form verbatim.
@@ -154,6 +170,14 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 	old_text TEXT NOT NULL DEFAULT '',
 	new_text TEXT NOT NULL DEFAULT '',
 	started_at TEXT,
+	-- started_at is second-precision text; started_ms keeps the instant to
+	-- the millisecond so duration_ms (result arrival minus start, or the
+	-- agent's own figure) is exact. Both NULL when unknown.
+	started_ms INTEGER,
+	duration_ms INTEGER,
+	-- A file change's size in lines (canon.LineCounts); NULL when unknown.
+	lines_added INTEGER,
+	lines_removed INTEGER,
 	UNIQUE (session_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_kind ON tool_calls(kind, started_at DESC);
@@ -183,6 +207,8 @@ CREATE INDEX IF NOT EXISTS ` + IdxToolCallsRecentFiles + `
 CREATE INDEX IF NOT EXISTS ` + IdxToolCallsFileWrites + `
 	ON tool_calls(file_path, session_id, message_seq, name, kind, input_json)
 	WHERE kind IN ('file_write', 'file_edit');
+
+` + sessionEventsSchema + `
 
 -- Artifacts stand alone; sessions attach via artifact_sessions with
 -- explicit relation + evidence.
@@ -269,6 +295,9 @@ CREATE TABLE IF NOT EXISTS source_files (
 	-- parsing at the byte where the last pass stopped; '' means the next
 	-- change re-parses the whole source.
 	parse_state TEXT NOT NULL DEFAULT '',
+	-- Adapter-owned format version. A bump forces a full parse even when
+	-- the source bytes did not change, recovering newly captured fields.
+	parse_version INTEGER NOT NULL DEFAULT 1,
 	indexed_at TEXT NOT NULL
 );
 
@@ -319,7 +348,15 @@ CREATE TABLE IF NOT EXISTS rollup_usage_daily (
 	-- the pricing table computed for rows with no reported figure.
 	cost_reported_usd REAL NOT NULL DEFAULT 0,
 	cost_estimated_usd REAL NOT NULL DEFAULT 0,
-	priced INTEGER NOT NULL DEFAULT 1, -- 0: model unknown to the pricing table
+	-- Exact automatic-cost materialization and provenance.
+	cost_nanos INTEGER NOT NULL DEFAULT 0,
+	cost_reported_nanos INTEGER NOT NULL DEFAULT 0,
+	cost_estimated_nanos INTEGER NOT NULL DEFAULT 0,
+	unpriced_input_tokens INTEGER NOT NULL DEFAULT 0,
+	unpriced_output_tokens INTEGER NOT NULL DEFAULT 0,
+	unpriced_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+	unpriced_cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+	priced INTEGER NOT NULL DEFAULT 1, -- 0: at least one non-zero auto bucket has no rate
 	PRIMARY KEY (day, agent_id, workspace_id, model)
 );
 
@@ -412,6 +449,56 @@ CREATE TRIGGER IF NOT EXISTS search_docs_au AFTER UPDATE ON search_docs BEGIN
 END;
 `
 
+// sessionEventsSchema is shared by the initial schema and migration v20.
+const sessionEventsSchema = `
+-- Things an agent recorded about a session that are neither messages nor
+-- tool calls (API errors, denials, PR links, turn timings, compactions,
+-- hooks, effort changes). The typed columns are what surfaces filter and
+-- aggregate on; payload_json holds the kind-specific rest.
+CREATE TABLE IF NOT EXISTS session_events (
+	id INTEGER PRIMARY KEY,
+	session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+	message_seq INTEGER NOT NULL DEFAULT 0,
+	kind TEXT NOT NULL,
+	at TEXT,
+	label TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT '',
+	duration_ms INTEGER NOT NULL DEFAULT 0,
+	detail TEXT NOT NULL DEFAULT '',
+	payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_kind ON session_events(kind, at);
+CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(session_id, kind);
+`
+
+const dirtySessionsSchema = `CREATE TABLE IF NOT EXISTS dirty_sessions (session_id INTEGER PRIMARY KEY);`
+
+// usageClaimVersionsSchema retains prior parser interpretations. Version zero
+// is legacy/unversioned provenance; never infer its source from the current
+// materialized owner, which may have inherited a pruned source's usage.
+const usageClaimVersionsSchema = `
+CREATE TABLE IF NOT EXISTS usage_claim_versions (
+ agent_id INTEGER NOT NULL REFERENCES agents(id),
+ content_id TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ parser_version INTEGER NOT NULL,
+ source_path TEXT NOT NULL DEFAULT '',
+ usage_json TEXT NOT NULL,
+ PRIMARY KEY(agent_id,content_id,request_id,parser_version)
+);`
+
+// usageClaimsSchema preserves the best observation of a request independently
+// of whichever transcript copy currently owns its materialized usage row.
+const usageClaimsSchema = `
+CREATE TABLE IF NOT EXISTS usage_claims (
+ agent_id INTEGER NOT NULL REFERENCES agents(id),
+ content_id TEXT NOT NULL,
+ request_id TEXT NOT NULL,
+ usage_json TEXT NOT NULL,
+ PRIMARY KEY(agent_id, content_id, request_id)
+);
+`
+
 // userSchema holds user-created state. It is NEVER dropped by
 // ResetDerived / --rebuild. Rows attach to entities via natural keys
 // (e.g. "agent_slug/session_external_id") so they survive re-ingest.
@@ -434,6 +521,7 @@ var derivedTables = []string{
 	"scan_state",
 	"rollup_session_days",
 	"rollup_usage_daily",
+	"dirty_sessions",
 	"ingest_issues",
 	"ingest_runs",
 	"source_files",
@@ -443,8 +531,11 @@ var derivedTables = []string{
 	"pending_artifact_links",
 	"artifact_sessions",
 	"artifacts",
+	"session_events",
 	"tool_calls",
 	"message_usage",
+	"usage_claim_versions",
+	"usage_claims",
 	"messages",
 	"pending_relations",
 	"session_relations",
@@ -457,8 +548,161 @@ var derivedTables = []string{
 // at the latest schema and never replay these.
 type migration func(ctx context.Context, tx *sql.Tx) error
 
-// migrations is intentionally empty until the v2.0 release: pre-release
-// schema changes go straight into initialSchema (see schemaVersion). The
-// first released schema becomes the baseline; every change after it
-// appends an entry here and bumps schemaVersion.
-var migrations = []migration{}
+// migrations carries every post-v2.0 schema change. Existing archives are
+// upgraded in place; fresh databases are born directly from initialSchema.
+var migrations = []migration{
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, q := range []string{
+			`ALTER TABLE messages ADD COLUMN provider TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE message_usage ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE source_files ADD COLUMN parse_version INTEGER NOT NULL DEFAULT 1`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN unpriced_input_tokens INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN unpriced_output_tokens INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN unpriced_cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN unpriced_cache_write_tokens INTEGER NOT NULL DEFAULT 0`,
+			// Pricing semantics and the rollup input shape changed. Emptying
+			// both materializations lets the existing ingest self-heal rebuild
+			// them with the new algorithm while preserving the archive.
+			`DELETE FROM rollup_session_days`,
+			`DELETE FROM rollup_usage_daily`,
+		} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, q := range []string{
+			`ALTER TABLE message_usage ADD COLUMN reported_cost_nanos INTEGER`,
+			`UPDATE message_usage SET reported_cost_nanos = CAST(ROUND(reported_cost_usd * 1000000000) AS INTEGER) WHERE reported_cost_usd IS NOT NULL`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN cost_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN cost_reported_nanos INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE rollup_usage_daily ADD COLUMN cost_estimated_nanos INTEGER NOT NULL DEFAULT 0`,
+			`DELETE FROM rollup_session_days`,
+			`DELETE FROM rollup_usage_daily`,
+		} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, q := range []string{
+			`ALTER TABLE messages ADD COLUMN text_content TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE messages ADD COLUMN usage_request_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE tool_calls ADD COLUMN result_content TEXT NOT NULL DEFAULT ''`,
+			`UPDATE messages SET text_content = COALESCE((SELECT text_content FROM search_docs WHERE session_id = messages.session_id AND doc_type = 'message' AND seq = messages.seq LIMIT 1), '')`,
+			`UPDATE messages SET usage_request_id = COALESCE((SELECT request_id FROM message_usage WHERE message_id = messages.id), '')`,
+			usageClaimsSchema,
+			`INSERT OR REPLACE INTO meta(key,value) VALUES ('derived_dirty','1')`,
+		} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		return seedUsageClaims(ctx, tx)
+	},
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, q := range []string{dirtySessionsSchema, `INSERT INTO dirty_sessions SELECT id FROM sessions`, `INSERT OR REPLACE INTO meta(key,value) VALUES ('derived_dirty','1'),('rollups_full','1')`} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, q := range []string{
+			usageClaimVersionsSchema,
+			`INSERT INTO usage_claim_versions(agent_id,content_id,request_id,parser_version,usage_json) SELECT agent_id,content_id,request_id,0,usage_json FROM usage_claims`,
+		} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	// v19: thinking text and image locators. Existing rows stay empty until
+	// their source reparses (the adapters' ParseVersion bumps force that);
+	// archived sessions whose source is gone keep their raw content, which
+	// still holds both.
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, column := range []string{"thinking_text", "images_json"} {
+			if err := addColumn(ctx, tx, "messages", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	// v20: session_events. Rows appear as sources reparse (the adapters'
+	// ParseVersion bumps force that).
+	func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, sessionEventsSchema)
+		return err
+	},
+	// v21: tool call timing, filled as sources reparse.
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, column := range []string{"started_ms", "duration_ms"} {
+			if err := addColumn(ctx, tx, "tool_calls", column, "INTEGER"); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	// v22: file change sizes, filled as sources reparse.
+	func(ctx context.Context, tx *sql.Tx) error {
+		for _, column := range []string{"lines_added", "lines_removed"} {
+			if err := addColumn(ctx, tx, "tool_calls", column, "INTEGER"); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	// v23: per-message effort, filled as sources reparse.
+	func(ctx context.Context, tx *sql.Tx) error {
+		return addColumn(ctx, tx, "messages", "effort", "TEXT NOT NULL DEFAULT ''")
+	},
+	// v24: drop v1 imports that duplicate a live session under another
+	// agent. v1 indexed some Pi session files as Claude sessions, and the
+	// importer only looked for an existing Claude session, so it imported
+	// them as claude-code orphans beside the Pi sessions v2 indexes from the
+	// same files (68 locally: duplicate transcripts and search hits, no
+	// usage). The live session is the same conversation, parsed losslessly.
+	// Search docs go first: they are kept in step with FTS by explicit
+	// deletes, not by the cascade.
+	func(ctx context.Context, tx *sql.Tx) error {
+		const dups = `SELECT s.id FROM sessions s
+			WHERE s.origin = 'imported-v1' AND EXISTS (
+				SELECT 1 FROM sessions live
+				WHERE live.external_id = s.external_id AND live.agent_id <> s.agent_id
+				  AND live.origin <> 'imported-v1')`
+		for _, q := range []string{
+			`DELETE FROM search_docs WHERE session_id IN (` + dups + `)`,
+			`DELETE FROM sessions WHERE id IN (` + dups + `)`,
+			`INSERT OR REPLACE INTO meta(key,value) VALUES ('derived_dirty','1')`,
+		} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+}
+
+// addColumn adds a column unless it already exists. Like the CREATE ...
+// IF NOT EXISTS statements of the migrations before it, this keeps a
+// migration safe to run against a database that already has the latest
+// shape.
+func addColumn(ctx context.Context, tx *sql.Tx, table, column, decl string) error {
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+decl)
+	return err
+}
